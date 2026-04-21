@@ -1,7 +1,6 @@
 import { JsonRpcProvider, Contract, formatUnits } from 'ethers';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
-import { createClient } from 'redis';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -11,7 +10,6 @@ dotenv.config();
 const DELAY_BETWEEN_RPC_MS = parseInt(process.env.EVM_DELAY_RPC_MS, 10) || 2000;
 const DELAY_BETWEEN_WALLET_MS = parseInt(process.env.EVM_DELAY_WALLET_MS, 10) || 500;
 const INTERVAL_MS = parseInt(process.env.EVM_INTERVAL_MS, 10) || 300000;
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 const RPC_URLS = {
   'Ethereum': 'https://ethereum-rpc.publicnode.com',
@@ -84,8 +82,7 @@ const ERC20_ABI = [
 // ============================================================================
 // 4. CORE SYSTEM CLASSES & INTERNAL CACHE
 // ============================================================================
-const redisClient = createClient({ url: REDIS_URL });
-redisClient.on('error', (err) => console.error('[ERROR] Redis Client Error', err));
+const tokenCache = new Map();
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -117,13 +114,8 @@ async function getGoogleSheet() {
 async function getTokenMetadata(contractAddress, provider, network) {
   // Check Cache
   const key = `token_meta:${network}:${contractAddress}`;
-  try {
-    const cached = await redisClient.get(key);
-    if (cached) {
-      return JSON.parse(cached);
-    }
-  } catch (err) {
-    console.error(`[Redis] Failed to GET ${key}:`, err.message);
+  if (tokenCache.has(key)) {
+    return tokenCache.get(key);
   }
 
   // Fetch directly from Smart Contract
@@ -133,11 +125,8 @@ async function getTokenMetadata(contractAddress, provider, network) {
 
   const meta = { symbol, decimals: Number(decimals) };
 
-  try {
-    await redisClient.set(key, JSON.stringify(meta), { EX: 86400 * 30 }); // cache 30 days
-  } catch (err) {
-    console.error(`[Redis] Failed to SET ${key}:`, err.message);
-  }
+  // Cache in memory
+  tokenCache.set(key, meta);
 
   return meta;
 }
@@ -307,13 +296,6 @@ async function runTracker() {
 async function main() {
   if (!SPREADSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
     console.error('[FATAL] Missing Google Sheets configuration in .env!');
-    process.exit(1);
-  }
-
-  try {
-    await redisClient.connect();
-  } catch (err) {
-    console.error('[FATAL] Could not connect to Redis:', err.message);
     process.exit(1);
   }
 
