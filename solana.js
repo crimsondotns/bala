@@ -19,7 +19,7 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
 const SHEET_TAB_NAME = 'Solana_Tracker';
-const SHEET_HEADERS = ['Timestamp', 'Wallet Name', 'Wallet Address', 'Token Mint', 'Symbol', 'Amount'];
+const SHEET_HEADERS = ['Symbol', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================================================
 // 3. TARGET WALLETS
@@ -108,12 +108,12 @@ async function fetchWalletTokens(wallet) {
     const symbol = tokenMap.get(mint) || 'Unknown';
     
     rows.push({
-      Timestamp: timestamp,
+      Symbol: symbol,
+      'Token Mint': mint,
+      Amount: tokenAmount.uiAmountString, // Use string to prevent floating point issues
       'Wallet Name': wallet.name,
       'Wallet Address': wallet.address,
-      'Token Mint': mint,
-      Symbol: symbol,
-      Amount: tokenAmount.uiAmountString // Use string to prevent floating point issues
+      Timestamp: timestamp
     });
   }
   
@@ -170,12 +170,12 @@ async function runTracker() {
       });
       // Requirements: 'หากเกิด Error... ห้ามใส่ค่าเป็น 0 ให้แสดงข้อความ Error หรือพ่น Error'
       allCollectedRows.push({
-        Timestamp: new Date().toISOString(),
+        Symbol: '-',
+        'Token Mint': 'Fetch Error',
+        Amount: err.message,
         'Wallet Name': wallet.name,
         'Wallet Address': wallet.address,
-        'Token Mint': 'Fetch Error',
-        Symbol: '-',
-        Amount: err.message
+        Timestamp: new Date().toISOString()
       });
     }
     

@@ -38,7 +38,7 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
 const SHEET_TAB_NAME = 'EVM_Tracker';
-const SHEET_HEADERS = ['Timestamp', 'Network', 'Wallet Name', 'Wallet Address', 'Token', 'Amount'];
+const SHEET_HEADERS = ['Tokens Name', 'Network', 'Tokens Address', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================================================
 // 3. TARGET WALLETS & ERC20 CONFIGURATION
@@ -149,12 +149,13 @@ async function runTracker() {
         const balanceEth = formatEther(balanceWei);
         
         allRows.push({
-          Timestamp: timestamp,
+          'Tokens Name': 'Native',
           Network: network,
+          'Tokens Address': '-',
+          Amount: balanceEth,
           'Wallet Name': wallet.name,
           'Wallet Address': wallet.address,
-          Token: 'Native',
-          Amount: balanceEth
+          Timestamp: timestamp
         });
 
         if (ERC20_TOKENS[network]) {
@@ -164,12 +165,13 @@ async function runTracker() {
             const tokenBalance = formatUnits(tokenBalanceWei, token.decimals || 18);
             
             allRows.push({
-              Timestamp: timestamp,
+              'Tokens Name': token.symbol,
               Network: network,
+              'Tokens Address': token.address,
+              Amount: tokenBalance,
               'Wallet Name': wallet.name,
               'Wallet Address': wallet.address,
-              Token: token.symbol,
-              Amount: tokenBalance
+              Timestamp: timestamp
             });
             await delay(DELAY_BETWEEN_WALLET_MS);
           }
@@ -186,12 +188,13 @@ async function runTracker() {
         });
 
         allRows.push({
-          Timestamp: timestamp,
+          'Tokens Name': 'Fetch Error',
           Network: network,
+          'Tokens Address': '-',
+          Amount: errorMsg,
           'Wallet Name': wallet.name,
           'Wallet Address': wallet.address,
-          Token: 'Fetch Error',
-          Amount: errorMsg
+          Timestamp: timestamp
         });
       }
       
