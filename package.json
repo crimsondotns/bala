@@ -4,9 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "start:solana": "node index.js",
-    "start:evm": "node evm_tracker.js",
+    "start": "node solana.js",
+    "start:solana": "node solana.js",
+    "start:evm": "node evm.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

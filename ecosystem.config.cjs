@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: 'solana-token-tracker',
-      script: './index.js',
+      script: './solana.js',
       instances: 1,
       autorestart: true,
       watch: false,
@@ -17,7 +17,7 @@ module.exports = {
     },
     {
       name: 'evm-token-tracker',
-      script: './evm_tracker.js',
+      script: './evm.js',
       instances: 1,
       autorestart: true,
       watch: false,

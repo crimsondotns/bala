@@ -4,7 +4,13 @@ import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// RPC Configuration
+// ============================================================================
+// 1. SETTINGS & APP CONFIGURATION
+// ============================================================================
+const DELAY_BETWEEN_RPC_MS = parseInt(process.env.EVM_DELAY_RPC_MS, 10) || 2000;
+const DELAY_BETWEEN_WALLET_MS = parseInt(process.env.EVM_DELAY_WALLET_MS, 10) || 500;
+const INTERVAL_MS = parseInt(process.env.EVM_INTERVAL_MS, 10) || 300000;
+
 const RPC_URLS = {
   'Ethereum': 'https://ethereum-rpc.publicnode.com',
   'BSC': 'https://bsc-rpc.publicnode.com',
@@ -25,8 +31,18 @@ const RPC_URLS = {
   'Dogechain': 'https://rpc.dogechain.dog'
 };
 
-// Wallets Configuration
-// Parse from env
+// ============================================================================
+// 2. OUTPUT CONFIGURATION (Google Sheets)
+// ============================================================================
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY;
+const SHEET_TAB_NAME = 'EVM_Tracker';
+const SHEET_HEADERS = ['Timestamp', 'Network', 'Wallet Name', 'Wallet Address', 'Token', 'Amount'];
+
+// ============================================================================
+// 3. TARGET WALLETS & ERC20 CONFIGURATION
+// ============================================================================
 let WALLETS = [];
 try {
   let rawVal = process.env.EVM_WALLETS_RAW || process.env.EVM_WALLETS_JSON || '[]';
@@ -42,7 +58,6 @@ try {
   process.exit(1);
 }
 
-// ERC20 Config (Optional for future use)
 const ERC20_TOKENS = {
   // 'Ethereum': [{ address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', symbol: 'USDT', decimals: 6 }]
 };
@@ -51,34 +66,31 @@ const ERC20_ABI = [
   "function balanceOf(address owner) view returns (uint256)"
 ];
 
-const DELAY_BETWEEN_RPC_MS = parseInt(process.env.EVM_DELAY_RPC_MS, 10) || 2000;
-const DELAY_BETWEEN_WALLET_MS = parseInt(process.env.EVM_DELAY_WALLET_MS, 10) || 500;
-const INTERVAL_MS = parseInt(process.env.EVM_INTERVAL_MS, 10) || 300000;
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-
+// ============================================================================
+// 4. CORE SYSTEM CLASSES & INTERNAL CACHE
+// ============================================================================
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function getGoogleSheet() {
   const serviceAccountAuth = new JWT({
-    email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
+    email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    key: GOOGLE_PRIVATE_KEY ? GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '',
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
   });
 
   const doc = new GoogleSpreadsheet(SPREADSHEET_ID, serviceAccountAuth);
   await doc.loadInfo(); 
   
-  const sheetTitle = 'EVM_Tracker';
-  let sheet = doc.sheetsByTitle[sheetTitle];
+  let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
-    sheet = await doc.addSheet({ title: sheetTitle, headerValues: ['Timestamp', 'Network', 'Wallet Name', 'Wallet Address', 'Token', 'Amount'] });
+    sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
   } else {
     try {
       await sheet.loadHeaderRow();
     } catch {
-      await sheet.setHeaderRow(['Timestamp', 'Network', 'Wallet Name', 'Wallet Address', 'Token', 'Amount']);
+      await sheet.setHeaderRow(SHEET_HEADERS);
     }
   }
   return sheet;
