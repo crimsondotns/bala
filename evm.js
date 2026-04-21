@@ -1,6 +1,7 @@
-import { JsonRpcProvider, Contract, formatEther, formatUnits } from 'ethers';
+import { JsonRpcProvider, Contract, formatUnits } from 'ethers';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
+import { createClient } from 'redis';
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -10,6 +11,7 @@ dotenv.config();
 const DELAY_BETWEEN_RPC_MS = parseInt(process.env.EVM_DELAY_RPC_MS, 10) || 2000;
 const DELAY_BETWEEN_WALLET_MS = parseInt(process.env.EVM_DELAY_WALLET_MS, 10) || 500;
 const INTERVAL_MS = parseInt(process.env.EVM_INTERVAL_MS, 10) || 300000;
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 const RPC_URLS = {
   'Ethereum': 'https://ethereum-rpc.publicnode.com',
@@ -58,17 +60,33 @@ try {
   process.exit(1);
 }
 
-const ERC20_TOKENS = {
-  // 'Ethereum': [{ address: '0xdAC17F958D2ee523a2206206994597C13D831ec7', symbol: 'USDT', decimals: 6 }]
-};
+let ALL_ERC20_TOKENS = [];
+try {
+  let rawTokens = process.env.ALL_ERC20_TOKENS || '[]';
+  if (!rawTokens.trim().startsWith('[')) {
+    rawTokens = '[' + rawTokens + ']';
+  }
+  ALL_ERC20_TOKENS = new Function('return ' + rawTokens)();
+  if (!Array.isArray(ALL_ERC20_TOKENS)) {
+    throw new Error('ALL_ERC20_TOKENS must be an array');
+  }
+} catch (err) {
+  console.error('[FATAL] Failed to parse ALL_ERC20_TOKENS from .env:', err.message);
+  process.exit(1);
+}
 
 const ERC20_ABI = [
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
   "function balanceOf(address owner) view returns (uint256)"
 ];
 
 // ============================================================================
 // 4. CORE SYSTEM CLASSES & INTERNAL CACHE
 // ============================================================================
+const redisClient = createClient({ url: REDIS_URL });
+redisClient.on('error', (err) => console.error('[ERROR] Redis Client Error', err));
+
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -94,6 +112,34 @@ async function getGoogleSheet() {
     }
   }
   return sheet;
+}
+
+async function getTokenMetadata(contractAddress, provider, network) {
+  // Check Cache
+  const key = `token_meta:${network}:${contractAddress}`;
+  try {
+    const cached = await redisClient.get(key);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+  } catch (err) {
+    console.error(`[Redis] Failed to GET ${key}:`, err.message);
+  }
+
+  // Fetch directly from Smart Contract
+  const contract = new Contract(contractAddress, ERC20_ABI, provider);
+  const symbol = await contract.symbol();
+  const decimals = await contract.decimals();
+
+  const meta = { symbol, decimals: Number(decimals) };
+
+  try {
+    await redisClient.set(key, JSON.stringify(meta), { EX: 86400 * 30 }); // cache 30 days
+  } catch (err) {
+    console.error(`[Redis] Failed to SET ${key}:`, err.message);
+  }
+
+  return meta;
 }
 
 let roundCounter = 0;
@@ -133,73 +179,89 @@ async function runTracker() {
   const networks = Object.keys(RPC_URLS);
 
   let successCount = 0;
-  let totalCount = networks.length * WALLETS.length; 
   const failList = [];
 
   for (let i = 0; i < networks.length; i++) {
     const network = networks[i];
     const rpcUrl = RPC_URLS[network];
     
-    const provider = new JsonRpcProvider(rpcUrl);
+    // Set staticNetwork: true to gracefully handle unreachable networks
+    const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
 
-    for (let j = 0; j < WALLETS.length; j++) {
-      const wallet = WALLETS[j];
+    for (let t = 0; t < ALL_ERC20_TOKENS.length; t++) {
+      const tokenAddress = ALL_ERC20_TOKENS[t];
+
+      // 1. Cross-chain Code Check
+      let code;
       try {
-        const balanceWei = await provider.getBalance(wallet.address);
-        const balanceEth = formatEther(balanceWei);
-        
-        allRows.push({
-          'Tokens Name': 'Native',
-          Network: network,
-          'Tokens Address': '-',
-          Amount: balanceEth,
-          'Wallet Name': wallet.name,
-          'Wallet Address': wallet.address,
-          Timestamp: timestamp
-        });
-
-        if (ERC20_TOKENS[network]) {
-          for (const token of ERC20_TOKENS[network]) {
-            const contract = new Contract(token.address, ERC20_ABI, provider);
-            const tokenBalanceWei = await contract.balanceOf(wallet.address);
-            const tokenBalance = formatUnits(tokenBalanceWei, token.decimals || 18);
-            
-            allRows.push({
-              'Tokens Name': token.symbol,
-              Network: network,
-              'Tokens Address': token.address,
-              Amount: tokenBalance,
-              'Wallet Name': wallet.name,
-              'Wallet Address': wallet.address,
-              Timestamp: timestamp
-            });
-            await delay(DELAY_BETWEEN_WALLET_MS);
-          }
-        }
-        
-        successCount++;
+        code = await provider.getCode(tokenAddress);
       } catch (err) {
-        const errorMsg = `[ERROR] Failed to fetch data for ${wallet.name} (${wallet.address}) on ${network}: ${err.message}`;
-        
+        // network likely down or timed out. Skip silently to save time.
+        continue; 
+      }
+
+      if (code === '0x') {
+        // Smart contract does not exist on this chain
+        continue;
+      }
+
+      // 2. Fetch Metadata
+      let meta;
+      try {
+        meta = await getTokenMetadata(tokenAddress, provider, network);
+      } catch (err) {
+        // Cant fetch metadata, push error and continue
         failList.push({
           network,
-          walletName: wallet.name,
-          error: err.message
+          walletName: 'System (Metadata Fetch)',
+          error: `Failed metadata for ${tokenAddress}: ${err.message}`
         });
-
-        allRows.push({
-          'Tokens Name': 'Fetch Error',
-          Network: network,
-          'Tokens Address': '-',
-          Amount: errorMsg,
-          'Wallet Name': wallet.name,
-          'Wallet Address': wallet.address,
-          Timestamp: timestamp
-        });
+        continue;
       }
-      
-      if (j < WALLETS.length - 1) {
-        await delay(DELAY_BETWEEN_WALLET_MS);
+
+      const contract = new Contract(tokenAddress, ERC20_ABI, provider);
+
+      // 3. Process Wallets
+      for (let j = 0; j < WALLETS.length; j++) {
+        const wallet = WALLETS[j];
+        try {
+          const tokenBalanceWei = await contract.balanceOf(wallet.address);
+          const tokenBalance = formatUnits(tokenBalanceWei, meta.decimals);
+          
+          allRows.push({
+            'Tokens Name': meta.symbol,
+            Network: network,
+            'Tokens Address': tokenAddress,
+            Amount: tokenBalance,
+            'Wallet Name': wallet.name,
+            'Wallet Address': wallet.address,
+            Timestamp: timestamp
+          });
+          
+          successCount++;
+        } catch (err) {
+          const errorMsg = `[ERROR] Failed to fetch data: ${err.message}`;
+          
+          failList.push({
+            network,
+            walletName: wallet.name,
+            error: err.message
+          });
+
+          allRows.push({
+            'Tokens Name': meta.symbol,
+            Network: network,
+            'Tokens Address': tokenAddress,
+            Amount: errorMsg,
+            'Wallet Name': wallet.name,
+            'Wallet Address': wallet.address,
+            Timestamp: timestamp
+          });
+        }
+        
+        if (j < WALLETS.length - 1) {
+          await delay(DELAY_BETWEEN_WALLET_MS);
+        }
       }
     }
     
@@ -208,6 +270,7 @@ async function runTracker() {
     }
   }
 
+  // Batch insert
   if (allRows.length > 0) {
     try {
       await sheet.addRows(allRows);
@@ -226,11 +289,14 @@ async function runTracker() {
   const nextSyncDate = new Date(endTime + INTERVAL_MS);
   const nextSyncStr = nextSyncDate.toISOString().replace('T', ' ').substring(0, 19);
 
+  // Reflect exactly what we attempted based on contract existence
+  const totalAttempts = successCount + failList.filter(f => f.network !== 'SYSTEM_ERROR' && f.walletName !== 'System (Metadata Fetch)').length;
+
   const summary = generateSummary({
     round: roundCounter,
     execTime: execTimeSeconds,
     nextSyncStr,
-    total: totalCount,
+    total: totalAttempts, 
     success: successCount,
     fails: failList
   });
@@ -239,8 +305,15 @@ async function runTracker() {
 }
 
 async function main() {
-  if (!SPREADSHEET_ID || !process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL || !process.env.GOOGLE_PRIVATE_KEY) {
+  if (!SPREADSHEET_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY) {
     console.error('[FATAL] Missing Google Sheets configuration in .env!');
+    process.exit(1);
+  }
+
+  try {
+    await redisClient.connect();
+  } catch (err) {
+    console.error('[FATAL] Could not connect to Redis:', err.message);
     process.exit(1);
   }
 
