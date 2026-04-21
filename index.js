@@ -15,12 +15,16 @@ const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 
 let wallets = [];
 try {
-  wallets = JSON.parse(process.env.WALLETS_JSON || '[]');
+  let rawVal = process.env.WALLETS_RAW || process.env.WALLETS_JSON || '[]';
+  if (!rawVal.trim().startsWith('[')) {
+    rawVal = '[' + rawVal + ']';
+  }
+  wallets = new Function('return ' + rawVal)();
   if (!Array.isArray(wallets) || wallets.length === 0) {
-    throw new Error('WALLETS_JSON must be a non-empty array.');
+    throw new Error('Wallets array is empty.');
   }
 } catch (err) {
-  console.error('[FATAL] Failed to parse WALLETS_JSON from .env:', err.message);
+  console.error('[FATAL] Failed to parse WALLETS_RAW from .env:', err.message);
   process.exit(1);
 }
 
