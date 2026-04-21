@@ -1,4 +1,4 @@
-import { JsonRpcProvider, Contract, formatUnits } from 'ethers';
+import { JsonRpcProvider, Contract, Interface, formatUnits, isAddress } from 'ethers';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
@@ -8,8 +8,9 @@ dotenv.config();
 // 1. SETTINGS & APP CONFIGURATION
 // ============================================================================
 const DELAY_BETWEEN_RPC_MS = parseInt(process.env.EVM_DELAY_RPC_MS, 10) || 2000;
-const DELAY_BETWEEN_WALLET_MS = parseInt(process.env.EVM_DELAY_WALLET_MS, 10) || 500;
 const INTERVAL_MS = parseInt(process.env.EVM_INTERVAL_MS, 10) || 300000;
+const MULTICALL_BATCH_SIZE = 500; // Limit payload size for public RPCs
+const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 
 const RPC_URLS = {
   'Ethereum': 'https://ethereum-rpc.publicnode.com',
@@ -68,24 +69,70 @@ try {
   if (!Array.isArray(ALL_ERC20_TOKENS)) {
     throw new Error('ALL_ERC20_TOKENS must be an array');
   }
+  
+  // Sanitize: Keep only valid 42-char EVM addresses to prevent ENS resolution errors
+  const originalLength = ALL_ERC20_TOKENS.length;
+  ALL_ERC20_TOKENS = ALL_ERC20_TOKENS.filter(token => token && typeof token === 'string' && isAddress(token));
+  if (ALL_ERC20_TOKENS.length < originalLength) {
+    console.log(`[INFO] Filtered out ${originalLength - ALL_ERC20_TOKENS.length} invalid EVM addresses (e.g. Aptos/Sui tokens).`);
+  }
 } catch (err) {
   console.error('[FATAL] Failed to parse ALL_ERC20_TOKENS from .env:', err.message);
   process.exit(1);
 }
 
-const ERC20_ABI = [
+// ============================================================================
+// 4. CORE SYSTEM CLASSES & ABIS
+// ============================================================================
+const MULTICALL3_ABI = [
+  {
+    "inputs": [
+      {
+        "components": [
+          { "name": "target", "type": "address" },
+          { "name": "allowFailure", "type": "bool" },
+          { "name": "callData", "type": "bytes" }
+        ],
+        "name": "calls",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "aggregate3",
+    "outputs": [
+      {
+        "components": [
+          { "name": "success", "type": "bool" },
+          { "name": "returnData", "type": "bytes" }
+        ],
+        "name": "returnData",
+        "type": "tuple[]"
+      }
+    ],
+    "stateMutability": "payable",
+    "type": "function"
+  }
+];
+
+const ERC20_INTERFACE = new Interface([
   "function symbol() view returns (string)",
   "function decimals() view returns (uint8)",
   "function balanceOf(address owner) view returns (uint256)"
-];
+]);
 
-// ============================================================================
-// 4. CORE SYSTEM CLASSES & INTERNAL CACHE
-// ============================================================================
+// We use an in-memory Map as requested earlier (or this replaces the Redis requirement conceptually without needing a local DB installation). 
+// You can seamlessly plug in a Redis connection here if you use Upstash.
 const tokenCache = new Map();
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function chunkArray(array, size) {
+  const chunked = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunked.push(array.slice(i, i + size));
+  }
+  return chunked;
 }
 
 async function getGoogleSheet() {
@@ -111,26 +158,6 @@ async function getGoogleSheet() {
   return sheet;
 }
 
-async function getTokenMetadata(contractAddress, provider, network) {
-  // Check Cache
-  const key = `token_meta:${network}:${contractAddress}`;
-  if (tokenCache.has(key)) {
-    return tokenCache.get(key);
-  }
-
-  // Fetch directly from Smart Contract
-  const contract = new Contract(contractAddress, ERC20_ABI, provider);
-  const symbol = await contract.symbol();
-  const decimals = await contract.decimals();
-
-  const meta = { symbol, decimals: Number(decimals) };
-
-  // Cache in memory
-  tokenCache.set(key, meta);
-
-  return meta;
-}
-
 let roundCounter = 0;
 
 function generateSummary({ round, execTime, nextSyncStr, total, success, fails }) {
@@ -138,7 +165,7 @@ function generateSummary({ round, execTime, nextSyncStr, total, success, fails }
   const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   
   let out = `\n${border}\n[${now}] PROCESS SUMMARY: EVM_TRACKER (ROUND #${round})\n${border}\n`;
-  out += `Status: Completed\nTotal Wallets: ${total}\nSuccess: ${success}\nFailed: ${fails.length}\n`;
+  out += `Status: Completed\nTotal Wallets Processed: ${total}\nSuccess: ${success}\nFailed: ${fails.length}\n`;
 
   if (fails.length > 0) {
     out += `\nFailed Items List:\n`;
@@ -169,123 +196,191 @@ async function runTracker() {
 
   let successCount = 0;
   const failList = [];
+  let totalProcessed = 0;
 
   for (let i = 0; i < networks.length; i++) {
     const network = networks[i];
     const rpcUrl = RPC_URLS[network];
-    
-    // Set staticNetwork: true to gracefully handle unreachable networks
     const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+    const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
 
-    for (let t = 0; t < ALL_ERC20_TOKENS.length; t++) {
-      const tokenAddress = ALL_ERC20_TOKENS[t];
-
-      // 1. Cross-chain Code Check
-      let code;
-      try {
-        code = await provider.getCode(tokenAddress);
-      } catch (err) {
-        // network likely down or timed out. Skip silently to save time.
-        continue; 
+    // -------------------------------------------------------------
+    // PHASE 1: Fetch missing Metadata on this network via Multicall3
+    // -------------------------------------------------------------
+    const missingTokens = [];
+    for (const token of ALL_ERC20_TOKENS) {
+      if (!tokenCache.has(`meta:${network}:${token}`)) {
+        missingTokens.push(token);
       }
+    }
 
-      if (code === '0x') {
-        // Smart contract does not exist on this chain
-        continue;
-      }
-
-      // 2. Fetch Metadata
-      let meta;
-      try {
-        meta = await getTokenMetadata(tokenAddress, provider, network);
-      } catch (err) {
-        // Cant fetch metadata, push error and continue
-        failList.push({
-          network,
-          walletName: 'System (Metadata Fetch)',
-          error: `Failed metadata for ${tokenAddress}: ${err.message}`
-        });
-        continue;
-      }
-
-      const contract = new Contract(tokenAddress, ERC20_ABI, provider);
-
-      // 3. Process Wallets
-      for (let j = 0; j < WALLETS.length; j++) {
-        const wallet = WALLETS[j];
-        try {
-          const tokenBalanceWei = await contract.balanceOf(wallet.address);
-          const tokenBalance = formatUnits(tokenBalanceWei, meta.decimals);
-          
-          allRows.push({
-            'Tokens Name': meta.symbol,
-            Network: network,
-            'Tokens Address': tokenAddress,
-            Amount: tokenBalance,
-            'Wallet Name': wallet.name,
-            'Wallet Address': wallet.address,
-            Timestamp: timestamp
-          });
-          
-          successCount++;
-        } catch (err) {
-          const errorMsg = `[ERROR] Failed to fetch data: ${err.message}`;
-          
-          failList.push({
-            network,
-            walletName: wallet.name,
-            error: err.message
-          });
-
-          allRows.push({
-            'Tokens Name': meta.symbol,
-            Network: network,
-            'Tokens Address': tokenAddress,
-            Amount: errorMsg,
-            'Wallet Name': wallet.name,
-            'Wallet Address': wallet.address,
-            Timestamp: timestamp
-          });
+    if (missingTokens.length > 0) {
+      const metaChunks = chunkArray(missingTokens, MULTICALL_BATCH_SIZE / 2); // 2 calls per token
+      for (const chunk of metaChunks) {
+        const metaCalls = [];
+        for (const token of chunk) {
+          metaCalls.push({ target: token, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("symbol") });
+          metaCalls.push({ target: token, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
         }
-        
-        if (j < WALLETS.length - 1) {
-          await delay(DELAY_BETWEEN_WALLET_MS);
+
+        try {
+          const results = await multicall.aggregate3.staticCall(metaCalls);
+          for (let c = 0; c < chunk.length; c++) {
+            const token = chunk[c];
+            const symRes = results[c * 2];
+            const decRes = results[c * 2 + 1];
+
+            if (symRes.success && decRes.success) {
+              try {
+                const symbol = ERC20_INTERFACE.decodeFunctionResult("symbol", symRes.returnData)[0];
+                const decimals = ERC20_INTERFACE.decodeFunctionResult("decimals", decRes.returnData)[0];
+                tokenCache.set(`meta:${network}:${token}`, { success: true, symbol, decimals: Number(decimals) });
+              } catch (e) {
+                tokenCache.set(`meta:${network}:${token}`, { success: false }); // Decode fail
+              }
+            } else {
+              tokenCache.set(`meta:${network}:${token}`, { success: false }); // Contract doesn't exist or isn't ERC20
+            }
+          }
+        } catch (err) {
+          // Metadata chunk failed (e.g. Network down or RPC reject). Mark unknown to retry later.
+          failList.push({ network, walletName: 'System (Metadata)', error: `Multicall Meta chunk failed: ${err.message}` });
         }
       }
     }
-    
+
+    // -------------------------------------------------------------
+    // PHASE 2: Build Balance Multicalls for all Wallets X valid Tokens
+    // -------------------------------------------------------------
+    const balanceCalls = [];
+    const callMappings = [];
+
+    for (const token of ALL_ERC20_TOKENS) {
+      const meta = tokenCache.get(`meta:${network}:${token}`);
+      if (meta && meta.success) {
+        // Token exists, prepare checks for all wallets
+        for (const wallet of WALLETS) {
+          balanceCalls.push({
+            target: token,
+            allowFailure: true,
+            callData: ERC20_INTERFACE.encodeFunctionData("balanceOf", [wallet.address])
+          });
+          callMappings.push({ token, wallet, meta });
+        }
+      }
+    }
+
+    if (balanceCalls.length > 0) {
+      const balChunks = chunkArray(balanceCalls, MULTICALL_BATCH_SIZE);
+      const mapChunks = chunkArray(callMappings, MULTICALL_BATCH_SIZE);
+
+      for (let c = 0; c < balChunks.length; c++) {
+        const chunk = balChunks[c];
+        const mapping = mapChunks[c];
+
+        try {
+          const results = await multicall.aggregate3.staticCall(chunk);
+          
+          for (let k = 0; k < results.length; k++) {
+            const res = results[k];
+            const m = mapping[k];
+            totalProcessed++;
+
+            if (res.success) {
+              try {
+                const balanceWei = ERC20_INTERFACE.decodeFunctionResult("balanceOf", res.returnData)[0];
+                const balanceStr = formatUnits(balanceWei, m.meta.decimals);
+                
+                // Skip writing 0 balances
+                if (parseFloat(balanceStr) > 0) {
+                  allRows.push({
+                    'Tokens Name': m.meta.symbol,
+                    Network: network,
+                    'Tokens Address': m.token,
+                    Amount: balanceStr,
+                    'Wallet Name': m.wallet.name,
+                    'Wallet Address': m.wallet.address,
+                    Timestamp: timestamp
+                  });
+                }
+                // Still count as process success even if it's 0 (it didn't error)
+                successCount++;
+              } catch (e) {
+                // Decode fail for successful call
+                failList.push({ network, walletName: m.wallet.name, error: `Decode failed for ${m.token}` });
+                allRows.push({
+                  'Tokens Name': m.meta.symbol,
+                  Network: network,
+                  'Tokens Address': m.token,
+                  Amount: `[ERROR] Decode Fail`,
+                  'Wallet Name': m.wallet.name,
+                  'Wallet Address': m.wallet.address,
+                  Timestamp: timestamp
+                });
+              }
+            } else {
+              // Call Reverted (allowFailure=true caught this safely)
+              const errorMsg = `Reverted on ${m.token}`;
+              failList.push({ network, walletName: m.wallet.name, error: errorMsg });
+              allRows.push({
+                'Tokens Name': m.meta.symbol,
+                Network: network,
+                'Tokens Address': m.token,
+                Amount: `[ERROR] ${errorMsg}`,
+                'Wallet Name': m.wallet.name,
+                'Wallet Address': m.wallet.address,
+                Timestamp: timestamp
+              });
+            }
+          }
+        } catch (err) {
+          // The entire RPC Multicall request chunk failed (e.g. Too Large or timeout)
+          failList.push({ network, walletName: 'Multicall Chunk', error: err.message });
+          for (const m of mapping) {
+             allRows.push({
+                'Tokens Name': m.meta.symbol,
+                Network: network,
+                'Tokens Address': m.token,
+                Amount: `[ERROR] RPC Multicall Timeout/Error`,
+                'Wallet Name': m.wallet.name,
+                'Wallet Address': m.wallet.address,
+                Timestamp: timestamp
+             });
+          }
+        }
+      }
+    }
+
     if (i < networks.length - 1) {
       await delay(DELAY_BETWEEN_RPC_MS);
     }
   }
 
-  // Batch insert
+  // -------------------------------------------------------------
+  // PHASE 3: Batch Write to Google Sheets
+  // -------------------------------------------------------------
   if (allRows.length > 0) {
-    try {
-      await sheet.addRows(allRows);
-    } catch (err) {
-      failList.push({
-        network: 'SYSTEM_ERROR',
-        walletName: 'Google Sheets Insert',
-        error: err.message
-      });
+    // Write in chunks to Google Sheets if rows > 5000 to prevent Request Payload Too Large
+    const rowChunks = chunkArray(allRows, 5000);
+    for (const rChunk of rowChunks) {
+      try {
+        await sheet.addRows(rChunk);
+      } catch (err) {
+        failList.push({ network: 'SYSTEM', walletName: 'Google Sheets', error: `Insert chunk failed: ${err.message}` });
+      }
     }
   }
 
   const endTime = Date.now();
   const execTimeSeconds = ((endTime - startTime) / 1000).toFixed(2) + ' seconds';
-  
   const nextSyncDate = new Date(endTime + INTERVAL_MS);
   const nextSyncStr = nextSyncDate.toISOString().replace('T', ' ').substring(0, 19);
-
-  // Reflect exactly what we attempted based on contract existence
-  const totalAttempts = successCount + failList.filter(f => f.network !== 'SYSTEM_ERROR' && f.walletName !== 'System (Metadata Fetch)').length;
 
   const summary = generateSummary({
     round: roundCounter,
     execTime: execTimeSeconds,
     nextSyncStr,
-    total: totalAttempts, 
+    total: totalProcessed,
     success: successCount,
     fails: failList
   });
