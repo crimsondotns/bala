@@ -103,31 +103,64 @@ async function fetchWalletTokens(wallet) {
   return rows;
 }
 
-async function runTracker() {
-  console.log(`\n--- Starting Tracker Cycle at ${new Date().toISOString()} ---`);
+let roundCounter = 0;
+
+function generateSummary({ round, execTime, nextSyncStr, total, success, fails }) {
+  const border = '--------------------------------------------------';
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
   
+  let out = `\n${border}\n[${now}] PROCESS SUMMARY: SOLANA_TRACKER (ROUND #${round})\n${border}\n`;
+  out += `Status: Completed\nTotal Wallets: ${total}\nSuccess: ${success}\nFailed: ${fails.length}\n`;
+
+  if (fails.length > 0) {
+    out += `\nFailed Items List:\n`;
+    for (const f of fails) {
+      out += `- [Solana] ${f.walletName}: ${f.error}\n`;
+    }
+  }
+
+  out += `\nStats:\n- Execution Time: ${execTime}\n- Next Sync: ${nextSyncStr}\n${border}\n`;
+  return out;
+}
+
+async function runTracker() {
+  roundCounter++;
+  const startTime = Date.now();
   let sheet;
+  
   try {
     sheet = await getGoogleSheet();
     await ensureHeaders(sheet);
   } catch (err) {
-    console.error('[ERROR] Failed to connect to Google Sheets:', err.message);
-    return; // abort this cycle if we can't save results
+    console.error('[FATAL] Failed to connect to Google Sheets:', err.message);
+    return; 
   }
 
   const allCollectedRows = [];
+  let successCount = 0;
+  const failList = [];
+  const totalCount = wallets.length;
 
   for (let i = 0; i < wallets.length; i++) {
     const wallet = wallets[i];
     try {
-      console.log(`[${i+1}/${wallets.length}] Fetching data for ${wallet.name} (${wallet.address})...`);
       const rows = await fetchWalletTokens(wallet);
       allCollectedRows.push(...rows);
-      console.log(`  -> Found ${rows.length} active SPL token accounts.`);
+      successCount++;
     } catch (err) {
-      console.error(`[ERROR] Failed to fetch data for ${wallet.name} (${wallet.address}):\n`, err);
+      failList.push({
+        walletName: wallet.name,
+        error: err.message
+      });
       // Requirements: 'หากเกิด Error... ห้ามใส่ค่าเป็น 0 ให้แสดงข้อความ Error หรือพ่น Error'
-      // We log it and skip inserting zero-values.
+      allCollectedRows.push({
+        Timestamp: new Date().toISOString(),
+        'Wallet Name': wallet.name,
+        'Wallet Address': wallet.address,
+        'Token Mint': 'Fetch Error',
+        Symbol: '-',
+        Amount: err.message
+      });
     }
     
     // Throttling to prevent Rate Limits, except after the last item
@@ -139,17 +172,31 @@ async function runTracker() {
   // Batch insert to Google Sheets
   if (allCollectedRows.length > 0) {
     try {
-      console.log(`Saving ${allCollectedRows.length} rows to Google Sheets...`);
       await sheet.addRows(allCollectedRows);
-      console.log('Successfully saved to Google Sheets.');
     } catch (err) {
-      console.error('[ERROR] Failed to save rows to Google Sheets:', err.message);
+      failList.push({
+        walletName: 'Google Sheets Insert',
+        error: err.message
+      });
     }
-  } else {
-    console.log('No token data to save in this cycle.');
   }
   
-  console.log(`--- Finished Tracker Cycle ---`);
+  const endTime = Date.now();
+  const execTimeSeconds = ((endTime - startTime) / 1000).toFixed(2) + ' seconds';
+  
+  const nextSyncDate = new Date(endTime + INTERVAL_MS);
+  const nextSyncStr = nextSyncDate.toISOString().replace('T', ' ').substring(0, 19);
+
+  const summary = generateSummary({
+    round: roundCounter,
+    execTime: execTimeSeconds,
+    nextSyncStr,
+    total: totalCount,
+    success: successCount,
+    fails: failList
+  });
+  
+  console.log(summary);
 }
 
 async function main() {
@@ -161,11 +208,8 @@ async function main() {
   // Initial setup: get token list for symbols
   await fetchTokenList();
   
-  // Run once immediately
   await runTracker();
 
-  // Then loop continuously
-  console.log(`Started continuous execution every ${INTERVAL_MS / 1000} seconds.`);
   setInterval(runTracker, INTERVAL_MS);
 }
 

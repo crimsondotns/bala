@@ -84,8 +84,29 @@ async function getGoogleSheet() {
   return sheet;
 }
 
+let roundCounter = 0;
+
+function generateSummary({ round, execTime, nextSyncStr, total, success, fails }) {
+  const border = '--------------------------------------------------';
+  const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  
+  let out = `\n${border}\n[${now}] PROCESS SUMMARY: EVM_TRACKER (ROUND #${round})\n${border}\n`;
+  out += `Status: Completed\nTotal Wallets: ${total}\nSuccess: ${success}\nFailed: ${fails.length}\n`;
+
+  if (fails.length > 0) {
+    out += `\nFailed Items List:\n`;
+    for (const f of fails) {
+      out += `- [${f.network}] ${f.walletName}: ${f.error}\n`;
+    }
+  }
+
+  out += `\nStats:\n- Execution Time: ${execTime}\n- Next Sync: ${nextSyncStr}\n${border}\n`;
+  return out;
+}
+
 async function runTracker() {
-  console.log(`\n--- Starting EVM Tracker Cycle at ${new Date().toISOString()} ---`);
+  roundCounter++;
+  const startTime = Date.now();
   
   let sheet;
   try {
@@ -99,18 +120,19 @@ async function runTracker() {
   const timestamp = new Date().toISOString();
   const networks = Object.keys(RPC_URLS);
 
+  let successCount = 0;
+  let totalCount = networks.length * WALLETS.length; 
+  const failList = [];
+
   for (let i = 0; i < networks.length; i++) {
     const network = networks[i];
     const rpcUrl = RPC_URLS[network];
-    console.log(`[Network: ${network}] Initializing provider...`);
     
-    // We recreate provider for each network
     const provider = new JsonRpcProvider(rpcUrl);
 
     for (let j = 0; j < WALLETS.length; j++) {
       const wallet = WALLETS[j];
       try {
-        console.log(`  -> Fetching Native Balance for ${wallet.name} (${wallet.address}) on ${network}`);
         const balanceWei = await provider.getBalance(wallet.address);
         const balanceEth = formatEther(balanceWei);
         
@@ -123,10 +145,8 @@ async function runTracker() {
           Amount: balanceEth
         });
 
-        // Loop ERC20 tokens if defined for this network
         if (ERC20_TOKENS[network]) {
           for (const token of ERC20_TOKENS[network]) {
-            console.log(`  -> Fetching ERC20 ${token.symbol} for ${wallet.name} on ${network}`);
             const contract = new Contract(token.address, ERC20_ABI, provider);
             const tokenBalanceWei = await contract.balanceOf(wallet.address);
             const tokenBalance = formatUnits(tokenBalanceWei, token.decimals || 18);
@@ -143,11 +163,16 @@ async function runTracker() {
           }
         }
         
+        successCount++;
       } catch (err) {
         const errorMsg = `[ERROR] Failed to fetch data for ${wallet.name} (${wallet.address}) on ${network}: ${err.message}`;
-        console.error(errorMsg);
         
-        // Push the error as the Amount so it doesn't default to 0 and records it for debugging
+        failList.push({
+          network,
+          walletName: wallet.name,
+          error: err.message
+        });
+
         allRows.push({
           Timestamp: timestamp,
           Network: network,
@@ -170,17 +195,32 @@ async function runTracker() {
 
   if (allRows.length > 0) {
     try {
-      console.log(`Saving ${allRows.length} rows to Google Sheets (Sheet: EVM_Tracker)...`);
       await sheet.addRows(allRows);
-      console.log('Successfully saved EVM data to Google Sheets.');
     } catch (err) {
-      console.error('[ERROR] Failed to save rows to Google Sheets:', err.message);
+      failList.push({
+        network: 'SYSTEM_ERROR',
+        walletName: 'Google Sheets Insert',
+        error: err.message
+      });
     }
-  } else {
-    console.log('No EVM token data to save in this cycle.');
   }
 
-  console.log(`--- Finished EVM Tracker Cycle ---`);
+  const endTime = Date.now();
+  const execTimeSeconds = ((endTime - startTime) / 1000).toFixed(2) + ' seconds';
+  
+  const nextSyncDate = new Date(endTime + INTERVAL_MS);
+  const nextSyncStr = nextSyncDate.toISOString().replace('T', ' ').substring(0, 19);
+
+  const summary = generateSummary({
+    round: roundCounter,
+    execTime: execTimeSeconds,
+    nextSyncStr,
+    total: totalCount,
+    success: successCount,
+    fails: failList
+  });
+  
+  console.log(summary);
 }
 
 async function main() {
@@ -189,10 +229,8 @@ async function main() {
     process.exit(1);
   }
 
-  // Run once immediately
   await runTracker();
 
-  console.log(`Started continuous EVM tracking every ${INTERVAL_MS / 1000} seconds.`);
   setInterval(runTracker, INTERVAL_MS);
 }
 
