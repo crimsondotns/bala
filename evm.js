@@ -18,7 +18,7 @@ const RPC_URLS = {
   'Arbitrum': 'https://arbitrum-one-rpc.publicnode.com',
   'Optimism': 'https://optimism-rpc.publicnode.com',
   'Base': 'https://base-rpc.publicnode.com',
-  'Avalanche': 'https://avalanche-c-chain-rpc.publicnode.com',
+  'Avalanche': 'https://api.avax.network/ext/bc/C/rpc',
   'Fantom': 'https://fantom-public.nodies.app',
   'Linea': 'https://linea-rpc.publicnode.com',
   'Blast': 'https://blast-rpc.publicnode.com',
