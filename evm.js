@@ -127,6 +127,16 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function formatTimestamp(date = new Date()) {
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const year = date.getFullYear();
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  return `${month}/${day}/${year} ${hours}:${minutes}:${seconds}`;
+}
+
 function chunkArray(array, size) {
   const chunked = [];
   for (let i = 0; i < array.length; i += size) {
@@ -191,7 +201,7 @@ async function runTracker() {
   }
 
   const allRows = [];
-  const timestamp = new Date().toISOString();
+  const timestamp = formatTimestamp();
   const networks = Object.keys(RPC_URLS);
 
   let successCount = 0;
@@ -357,8 +367,18 @@ async function runTracker() {
   }
 
   // -------------------------------------------------------------
-  // PHASE 3: Batch Write to Google Sheets
+  // PHASE 3: Clear and Batch Write to Google Sheets
   // -------------------------------------------------------------
+  // Clear existing data rows (except header) before writing new data
+  try {
+    const rows = await sheet.getRows();
+    for (const row of rows) {
+      await row.delete();
+    }
+  } catch (err) {
+    failList.push({ network: 'SYSTEM', walletName: 'Google Sheets Clear', error: err.message });
+  }
+
   if (allRows.length > 0) {
     // Write in chunks to Google Sheets if rows > 5000 to prevent Request Payload Too Large
     const rowChunks = chunkArray(allRows, 5000);
