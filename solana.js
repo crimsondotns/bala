@@ -213,6 +213,7 @@ async function main() {
   let totalAdded = 0;
   let totalUpdated = 0;
   let totalIdle = 0;
+  let totalEmpty = 0;
   const errors = [];
   const rowsToAdd = [];
 
@@ -223,7 +224,7 @@ async function main() {
     const batch500 = mainChunks[c];
     process.stdout.write(`[${String(c + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}] Processing ${batch500.length} ATAs... `);
     
-    let added = 0, updated = 0, idle = 0;
+    let added = 0, updated = 0, idle = 0, empty = 0;
     const subChunks = chunkArray(batch500, 10);
 
     for (let s = 0; s < subChunks.length; s++) {
@@ -236,12 +237,12 @@ async function main() {
           const accountInfo = response.value[j];
           const req = subChunk[j];
 
-          if (accountInfo === null) continue;
+          if (accountInfo === null) { empty++; totalEmpty++; continue; }
 
           const parsedInfo = accountInfo.data.parsed.info;
           const tokenAmount = parsedInfo.tokenAmount;
           
-          if (tokenAmount.uiAmount === 0) continue;
+          if (tokenAmount.uiAmount === 0) { empty++; totalEmpty++; continue; }
 
           const balanceStr = tokenAmount.uiAmountString;
           const uniqueKey = `${req.wallet.address}_${req.tokenMint}`;
@@ -285,7 +286,7 @@ async function main() {
       }
     }
     
-    console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle}`);
+    console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle} | 0 Empty: ${empty}`);
   }
 
   // 8. Batch Write
@@ -317,6 +318,7 @@ async function main() {
   console.log(`Total Added:    ${totalAdded}`);
   console.log(`Total Updated:  ${totalUpdated}`);
   console.log(`Total Idle:     ${totalIdle}`);
+  console.log(`Total Empty:    ${totalEmpty}`);
   
   if (errors.length > 0) {
     console.log(`Total Errors:   ${errors.length}`);

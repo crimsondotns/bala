@@ -1,7 +1,7 @@
 import { JsonRpcProvider, Contract, Interface, formatUnits, isAddress } from 'ethers';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
-import { createClient } from 'redis';
+
 import dotenv from 'dotenv';
 dotenv.config();
 
@@ -10,8 +10,6 @@ const RPC_CONFIG_RAW = process.env.RPC_CONFIG;
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const REDIS_URL = process.env.REDIS_URL;
-
 const SHEET_TAB_NAME = 'EVM_Tracker';
 const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SUBSCRIPTION_ERC20_TAB = 'SUBSCRIPTION ERC20';
@@ -72,32 +70,38 @@ function formatDate(date) {
 async function main() {
   const startTime = Date.now();
 
-  if (!RPC_CONFIG_RAW || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID || !REDIS_URL) {
+  if (!RPC_CONFIG_RAW || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
     console.error('Fatal Error: Missing required environment variables.');
     process.exit(1);
   }
 
-  let RPC_URLS;
+  let RPC_URLS = {};
   try {
-    RPC_URLS = JSON.parse(RPC_CONFIG_RAW);
+    const rawConfig = RPC_CONFIG_RAW.trim();
+    if (rawConfig.startsWith('{')) {
+      RPC_URLS = JSON.parse(rawConfig);
+    } else {
+      const urlList = rawConfig.split(',').map(s => s.trim()).filter(s => s);
+      for (const url of urlList) {
+        let name = "Unknown";
+        try {
+          const hostname = new URL(url).hostname;
+          if (hostname.includes('abs.xyz')) {
+            name = 'Abstract';
+          } else {
+            name = hostname.split('.')[0].replace('-rpc', '').replace('-rest', '').replace('-bor', '').replace('-c-chain', '').replace('-one', '');
+            name = name.charAt(0).toUpperCase() + name.slice(1);
+          }
+        } catch(e) { }
+        RPC_URLS[name] = url;
+      }
+    }
   } catch (err) {
-    console.error('Fatal Error: JSON Parsing failed for RPC_CONFIG.', err.message);
+    console.error('Fatal Error: Parsing failed for RPC_CONFIG.', err.message);
     process.exit(1);
   }
 
-  // Connect Redis
-  const redis = createClient({ url: REDIS_URL });
-  redis.on('error', (err) => {
-    console.error('Fatal Error: Redis Client Error', err);
-    process.exit(1);
-  });
-  
-  try {
-    await redis.connect();
-  } catch (err) {
-    console.error('Fatal Error: Failed to connect to Redis', err.message);
-    process.exit(1);
-  }
+
 
   // Connect Google Sheets
   const serviceAccountAuth = new JWT({
@@ -228,6 +232,7 @@ async function main() {
   let totalAdded = 0;
   let totalUpdated = 0;
   let totalIdle = 0;
+  let totalEmpty = 0;
   const errors = [];
   const rowsToAdd = [];
 
@@ -239,64 +244,39 @@ async function main() {
     const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
     const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
 
-    // 1. Resolve Metadata
-    const networkTokens = [];
-    for (const token of TOKENS) {
-      const redisKey = `meta:${network}:${token}`.toLowerCase();
-      let cached;
+    // 1. Resolve Metadata via Multicall (No Redis)
+    const networkTokens = TOKENS.map(token => ({ address: token }));
+    const metaChunks = chunkArray(networkTokens, MULTICALL_BATCH_SIZE / 2); // 2 calls per token
+
+    for (const chunk of metaChunks) {
+      const metaCalls = [];
+      for (const pt of chunk) {
+        metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("symbol") });
+        metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
+      }
       try {
-        cached = await redis.get(redisKey);
-      } catch (err) {
-        // Ignored redis read error
-      }
-      
-      if (cached) {
-        networkTokens.push({ address: token, ...JSON.parse(cached) });
-      } else {
-        networkTokens.push({ address: token, pending: true });
-      }
-    }
+        const results = await multicall.aggregate3.staticCall(metaCalls);
+        for (let i = 0; i < chunk.length; i++) {
+          const pt = chunk[i];
+          const symRes = results[i * 2];
+          const decRes = results[i * 2 + 1];
 
-    const pendingTokens = networkTokens.filter(t => t.pending);
-    if (pendingTokens.length > 0) {
-      const metaChunks = chunkArray(pendingTokens, MULTICALL_BATCH_SIZE / 2); // 2 calls per token
-      for (const chunk of metaChunks) {
-        const metaCalls = [];
-        for (const pt of chunk) {
-          metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("symbol") });
-          metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
-        }
-        try {
-          const results = await multicall.aggregate3.staticCall(metaCalls);
-          for (let i = 0; i < chunk.length; i++) {
-            const pt = chunk[i];
-            const symRes = results[i * 2];
-            const decRes = results[i * 2 + 1];
-
-            if (symRes.success && decRes.success) {
-              try {
-                const symbol = ERC20_INTERFACE.decodeFunctionResult("symbol", symRes.returnData)[0];
-                const decimals = Number(ERC20_INTERFACE.decodeFunctionResult("decimals", decRes.returnData)[0]);
-                const meta = { success: true, symbol, decimals };
-                pt.success = true;
-                pt.symbol = symbol;
-                pt.decimals = decimals;
-                await redis.set(`meta:${network}:${pt.address}`.toLowerCase(), JSON.stringify(meta));
-              } catch (e) {
-                const meta = { success: false };
-                pt.success = false;
-                await redis.set(`meta:${network}:${pt.address}`.toLowerCase(), JSON.stringify(meta));
-              }
-            } else {
-              const meta = { success: false };
+          if (symRes.success && decRes.success) {
+            try {
+              pt.symbol = ERC20_INTERFACE.decodeFunctionResult("symbol", symRes.returnData)[0];
+              pt.decimals = Number(ERC20_INTERFACE.decodeFunctionResult("decimals", decRes.returnData)[0]);
+              pt.success = true;
+            } catch (e) {
               pt.success = false;
-              await redis.set(`meta:${network}:${pt.address}`.toLowerCase(), JSON.stringify(meta));
             }
+          } else {
+            pt.success = false;
           }
-        } catch (err) {
-          errors.push(`[${network}] Metadata Multicall failed: ${err.message}`);
-          for (const pt of chunk) { pt.success = false; }
         }
+      } catch (err) {
+        const errMsg = err.shortMessage || err.message.split(' (')[0];
+        errors.push(`[${network}] Metadata Multicall failed: ${errMsg}`);
+        for (const pt of chunk) { pt.success = false; }
       }
     }
 
@@ -327,7 +307,7 @@ async function main() {
     for (let c = 0; c < balChunks.length; c++) {
       const chunk = balChunks[c];
       const mapping = mapChunks[c];
-      let added = 0, updated = 0, idle = 0;
+      let added = 0, updated = 0, idle = 0, empty = 0;
 
       process.stdout.write(`[${String(c + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}] Processing ${chunk.length} calls... `);
 
@@ -377,16 +357,20 @@ async function main() {
                   totalAdded++;
                   cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceStr }); 
                 }
+              } else {
+                empty++;
+                totalEmpty++;
               }
             } catch (e) {
               // Ignore decode fail for successful call
             }
           }
         }
-        console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle}`);
+        console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle} | 0 Empty: ${empty}`);
       } catch (err) {
         console.log(`FAILED!`);
-        errors.push(`[${network}] Batch Multicall failed: ${err.message}`);
+        const errMsg = err.shortMessage || err.message.split(' (')[0];
+        errors.push(`[${network}] Batch Multicall failed: ${errMsg}`);
       }
     }
   }
@@ -411,7 +395,7 @@ async function main() {
     }
   }
 
-  await redis.quit();
+
 
   const endTime = Date.now();
   const execSecs = ((endTime - startTime) / 1000).toFixed(2);
@@ -423,6 +407,7 @@ async function main() {
   console.log(`Total Added:    ${totalAdded}`);
   console.log(`Total Updated:  ${totalUpdated}`);
   console.log(`Total Idle:     ${totalIdle}`);
+  console.log(`Total Empty:    ${totalEmpty}`);
   
   if (errors.length > 0) {
     console.log(`\nErrors encountered:`);
