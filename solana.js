@@ -288,19 +288,20 @@ async function main() {
           if (tokenAmount.uiAmount === 0) { empty++; totalEmpty++; continue; }
 
           const balanceStr = tokenAmount.uiAmountString;
+          const balanceFloat = parseFloat(balanceStr);
           const uniqueKey = `${req.wallet.address}_${req.tokenMint}`;
           const nowStr = formatDate(new Date());
 
           if (cacheMap.has(uniqueKey)) {
             const cached = cacheMap.get(uniqueKey);
-            if (cached.amount !== balanceStr) {
+            if (parseFloat(cached.amount) !== balanceFloat) {
               const cellAmount = sheet.getCell(cached.rowIdx, 3);
               const cellTimestamp = sheet.getCell(cached.rowIdx, 6);
-              cellAmount.value = balanceStr;
+              cellAmount.value = balanceFloat;
               cellTimestamp.value = nowStr;
               updated++;
               totalUpdated++;
-              cached.amount = balanceStr;
+              cached.amount = balanceFloat;
             } else {
               idle++;
               totalIdle++;
@@ -310,14 +311,14 @@ async function main() {
               'Symbol': req.tokenSymbol,
               'Network': 'Solana',
               'Token Mint': req.tokenMint,
-              'Amount': balanceStr,
+              'Amount': balanceFloat,
               'Wallet Name': req.wallet.name,
               'Wallet Address': req.wallet.address,
               'Timestamp': nowStr
             });
             added++;
             totalAdded++;
-            cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceStr });
+            cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceFloat });
           }
         }
       } catch (err) {
@@ -329,17 +330,17 @@ async function main() {
       }
     }
     
-    const addedPad = String(added).padStart(2, '0');
-    const updatedPad = String(updated).padStart(2, '0');
+    const addedPad = String(added).padStart(3, '0');
+    const updatedPad = String(updated).padStart(3, '0');
     const idlePad = String(idle).padStart(3, '0');
     const emptyPad = String(empty).padStart(3, '0');
 
     const addedText = added > 0 ? `${c.green}+ Added: ${addedPad}${c.reset}` : `${c.gray}+ Added: ${addedPad}${c.reset}`;
     const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updatedPad}${c.reset}` : `${c.gray}~ Updated: ${updatedPad}${c.reset}`;
     const idleText = `${c.gray}. Idle: ${idlePad}${c.reset}`;
-    const emptyText = `${c.gray}0 Empty: ${emptyPad}${c.reset}`;
-    
-    console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}|${c.reset} ${idleText} ${c.gray}|${c.reset} ${emptyText}`);
+    const emptyText = `${c.gray}o Empty: ${emptyPad}${c.reset}`;
+
+    console.log(`${addedText} | ${updatedText} | ${idleText} | ${emptyText}`);
   }
 
   // 8. Batch Write

@@ -1,0 +1,46 @@
+name: token worker
+
+on:
+  schedule:
+    # รันทุกเที่ยงคืนเวลาไทย (00:00 ICT = 17:00 UTC)
+    - cron: '0 17 * * *'
+  workflow_dispatch: # ปุ่มกดรันเองมือจากหน้า GitHub
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Run EVM Tracker
+        run: node evm.js
+        env:
+          RPC_CONFIG: ${{ secrets.RPC_CONFIG }}
+          WALLETS_RAW: ${{ secrets.WALLETS_RAW }}
+          ALL_ERC20_TOKENS: ${{ secrets.ALL_ERC20_TOKENS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+
+      - name: Run Solana Tracker
+        run: node solana.js
+        env:
+          WALLETS_RAW: ${{ secrets.WALLETS_RAW }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
