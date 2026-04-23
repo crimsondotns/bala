@@ -40,8 +40,23 @@ function delay(ms) {
 }
 
 function formatDate(date) {
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())}/${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  // Use Intl.DateTimeFormat for Asia/Bangkok (UTC+7) timezone
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Bangkok',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+
+  const parts = formatter.formatToParts(date);
+  const partMap = {};
+  parts.forEach(p => partMap[p.type] = p.value);
+
+  return `${partMap.month}/${partMap.day}/${partMap.year} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
 }
 
 async function main() {
