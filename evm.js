@@ -5,8 +5,19 @@ import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
 dotenv.config();
 
+const c = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  dim: '\x1b[2m',
+  cyan: '\x1b[36m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  gray: '\x1b[90m'
+};
+
 // 1. CONFIGURATION (Strictly Environment Variables)
-const RPC_CONFIG_RAW = process.env.RPC_CONFIG;
+
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -70,38 +81,10 @@ function formatDate(date) {
 async function main() {
   const startTime = Date.now();
 
-  if (!RPC_CONFIG_RAW || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
+  if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
     console.error('Fatal Error: Missing required environment variables.');
     process.exit(1);
   }
-
-  let RPC_URLS = {};
-  try {
-    const rawConfig = RPC_CONFIG_RAW.trim();
-    if (rawConfig.startsWith('{')) {
-      RPC_URLS = JSON.parse(rawConfig);
-    } else {
-      const urlList = rawConfig.split(',').map(s => s.trim()).filter(s => s);
-      for (const url of urlList) {
-        let name = "Unknown";
-        try {
-          const hostname = new URL(url).hostname;
-          if (hostname.includes('abs.xyz')) {
-            name = 'Abstract';
-          } else {
-            name = hostname.split('.')[0].replace('-rpc', '').replace('-rest', '').replace('-bor', '').replace('-c-chain', '').replace('-one', '');
-            name = name.charAt(0).toUpperCase() + name.slice(1);
-          }
-        } catch(e) { }
-        RPC_URLS[name] = url;
-      }
-    }
-  } catch (err) {
-    console.error('Fatal Error: Parsing failed for RPC_CONFIG.', err.message);
-    process.exit(1);
-  }
-
-
 
   // Connect Google Sheets
   const serviceAccountAuth = new JWT({
@@ -115,6 +98,44 @@ async function main() {
     await doc.loadInfo();
   } catch (err) {
     console.error('Fatal Error: Failed to connect to Google Sheets', err.message);
+    process.exit(1);
+  }
+
+  // Load RPC_URLS from 'nodes' tab
+  const nodesSheet = doc.sheetsByTitle['nodes'];
+  if (!nodesSheet) {
+    console.error("Fatal Error: Sheet 'nodes' not found.");
+    process.exit(1);
+  }
+
+  let RPC_URLS = {};
+  try {
+    const maxRows = nodesSheet.rowCount;
+    if (maxRows >= 2) {
+      await nodesSheet.loadCells(`A1:B${maxRows}`);
+      for (let r = 1; r < maxRows; r++) {
+        const netCell = nodesSheet.getCell(r, 0);
+        const urlCell = nodesSheet.getCell(r, 1);
+        if (netCell && netCell.value && urlCell && urlCell.value) {
+          const networkName = String(netCell.value).trim();
+          const rpcUrl = String(urlCell.value).trim();
+          if (networkName.toLowerCase() !== 'solana') {
+             // Use original case, but capitalize first letter if needed
+             let name = networkName;
+             if (name.toLowerCase() === 'bsc') name = 'Bsc';
+             else name = name.charAt(0).toUpperCase() + name.slice(1);
+             RPC_URLS[name] = rpcUrl;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Fatal Error: Failed to read from 'nodes' tab.", err.message);
+    process.exit(1);
+  }
+
+  if (Object.keys(RPC_URLS).length === 0) {
+    console.error("Fatal Error: No EVM RPCs found in 'nodes' tab.");
     process.exit(1);
   }
 
@@ -239,7 +260,7 @@ async function main() {
   const networks = Object.keys(RPC_URLS);
 
   for (const network of networks) {
-    console.log(`\n>> Network: ${network}`);
+    console.log(`\n${c.cyan}${c.bright}>> Network: ${network}${c.reset}`);
     const rpcUrl = RPC_URLS[network];
     const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
     const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
@@ -309,7 +330,7 @@ async function main() {
       const mapping = mapChunks[c];
       let added = 0, updated = 0, idle = 0, empty = 0;
 
-      process.stdout.write(`[${String(c + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}] Processing ${chunk.length} calls... `);
+      process.stdout.write(`${c.gray}[${String(c + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset} Processing ${chunk.length} calls... `);
 
       try {
         const results = await multicall.aggregate3.staticCall(chunk);
@@ -366,9 +387,12 @@ async function main() {
             }
           }
         }
-        console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle} | 0 Empty: ${empty}`);
+        
+        const addedText = added > 0 ? `${c.green}+ Added: ${added}${c.reset}` : `${c.gray}+ Added: ${added}${c.reset}`;
+        const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updated}${c.reset}` : `${c.gray}~ Updated: ${updated}${c.reset}`;
+        console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}| . Idle: ${idle} | 0 Empty: ${empty}${c.reset}`);
       } catch (err) {
-        console.log(`FAILED!`);
+        console.log(`${c.red}FAILED!${c.reset}`);
         const errMsg = err.shortMessage || err.message.split(' (')[0];
         errors.push(`[${network}] Batch Multicall failed: ${errMsg}`);
       }
@@ -400,20 +424,20 @@ async function main() {
   const endTime = Date.now();
   const execSecs = ((endTime - startTime) / 1000).toFixed(2);
 
-  console.log(`\n--------------------------------------------------`);
-  console.log(`PROCESS SUMMARY: EVM WORKER`);
-  console.log(`--------------------------------------------------`);
+  console.log(`\n${c.gray}--------------------------------------------------${c.reset}`);
+  console.log(`${c.cyan}${c.bright}PROCESS SUMMARY: EVM WORKER${c.reset}`);
+  console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   console.log(`Execution Time: ${execSecs} seconds`);
-  console.log(`Total Added:    ${totalAdded}`);
-  console.log(`Total Updated:  ${totalUpdated}`);
-  console.log(`Total Idle:     ${totalIdle}`);
-  console.log(`Total Empty:    ${totalEmpty}`);
+  console.log(`${c.green}Total Added:    ${totalAdded}${c.reset}`);
+  console.log(`${c.yellow}Total Updated:  ${totalUpdated}${c.reset}`);
+  console.log(`${c.gray}Total Idle:     ${totalIdle}${c.reset}`);
+  console.log(`${c.gray}Total Empty:    ${totalEmpty}${c.reset}`);
   
   if (errors.length > 0) {
-    console.log(`\nErrors encountered:`);
-    errors.forEach(e => console.log(`- ${e}`));
+    console.log(`\n${c.red}Errors encountered:${c.reset}`);
+    errors.forEach(e => console.log(`${c.red}- ${e}${c.reset}`));
   }
-  console.log(`--------------------------------------------------`);
+  console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   
   process.exit(0);
 }

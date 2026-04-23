@@ -5,8 +5,18 @@ import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
 dotenv.config();
 
+const c = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  dim: '\x1b[2m',
+  cyan: '\x1b[36m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
+  gray: '\x1b[90m'
+};
+
 // 1. CONFIGURATION (Strictly Environment Variables)
-const RPC_ENDPOINT = process.env.RPC_ENDPOINT || 'https://solana-rpc.publicnode.com';
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -37,7 +47,7 @@ function formatDate(date) {
 async function main() {
   const startTime = Date.now();
 
-  if (!RPC_ENDPOINT || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
+  if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
     console.error('Fatal Error: Missing required environment variables.');
     process.exit(1);
   }
@@ -55,6 +65,37 @@ async function main() {
     await doc.loadInfo();
   } catch (err) {
     console.error('Fatal Error: Failed to connect to Google Sheets', err.message);
+    process.exit(1);
+  }
+
+  // Load RPC_ENDPOINT from 'nodes' tab
+  const nodesSheet = doc.sheetsByTitle['nodes'];
+  if (!nodesSheet) {
+    console.error("Fatal Error: Sheet 'nodes' not found.");
+    process.exit(1);
+  }
+
+  let RPC_ENDPOINT = '';
+  try {
+    const maxRows = nodesSheet.rowCount;
+    if (maxRows >= 2) {
+      await nodesSheet.loadCells(`A1:B${maxRows}`);
+      for (let r = 1; r < maxRows; r++) {
+        const netCell = nodesSheet.getCell(r, 0);
+        const urlCell = nodesSheet.getCell(r, 1);
+        if (netCell && netCell.value && String(netCell.value).trim().toLowerCase() === 'solana') {
+          RPC_ENDPOINT = urlCell && urlCell.value ? String(urlCell.value).trim() : '';
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Fatal Error: Failed to read from 'nodes' tab.", err.message);
+    process.exit(1);
+  }
+
+  if (!RPC_ENDPOINT) {
+    console.error("Fatal Error: Solana RPC not found in 'nodes' tab.");
     process.exit(1);
   }
 
@@ -208,7 +249,7 @@ async function main() {
   }
 
   // 7. Bulk Processing
-  console.log(`\n>> Network: SOLANA`);
+  console.log(`\n${c.cyan}${c.bright}>> Network: SOLANA${c.reset}`);
   
   let totalAdded = 0;
   let totalUpdated = 0;
@@ -222,7 +263,7 @@ async function main() {
 
   for (let c = 0; c < mainChunks.length; c++) {
     const batch500 = mainChunks[c];
-    process.stdout.write(`[${String(c + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}] Processing ${batch500.length} ATAs... `);
+    process.stdout.write(`${c.gray}[${String(c + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}]${c.reset} Processing ${batch500.length} ATAs... `);
     
     let added = 0, updated = 0, idle = 0, empty = 0;
     const subChunks = chunkArray(batch500, 10);
@@ -286,7 +327,9 @@ async function main() {
       }
     }
     
-    console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle} | 0 Empty: ${empty}`);
+    const addedText = added > 0 ? `${c.green}+ Added: ${added}${c.reset}` : `${c.gray}+ Added: ${added}${c.reset}`;
+    const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updated}${c.reset}` : `${c.gray}~ Updated: ${updated}${c.reset}`;
+    console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}| . Idle: ${idle} | 0 Empty: ${empty}${c.reset}`);
   }
 
   // 8. Batch Write
@@ -311,23 +354,23 @@ async function main() {
 
   const execSecs = ((Date.now() - startTime) / 1000).toFixed(2);
 
-  console.log(`\n--------------------------------------------------`);
-  console.log(`PROCESS SUMMARY: SOLANA WORKER`);
-  console.log(`--------------------------------------------------`);
+  console.log(`\n${c.gray}--------------------------------------------------${c.reset}`);
+  console.log(`${c.cyan}${c.bright}PROCESS SUMMARY: SOLANA WORKER${c.reset}`);
+  console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   console.log(`Execution Time: ${execSecs} seconds`);
-  console.log(`Total Added:    ${totalAdded}`);
-  console.log(`Total Updated:  ${totalUpdated}`);
-  console.log(`Total Idle:     ${totalIdle}`);
-  console.log(`Total Empty:    ${totalEmpty}`);
+  console.log(`${c.green}Total Added:    ${totalAdded}${c.reset}`);
+  console.log(`${c.yellow}Total Updated:  ${totalUpdated}${c.reset}`);
+  console.log(`${c.gray}Total Idle:     ${totalIdle}${c.reset}`);
+  console.log(`${c.gray}Total Empty:    ${totalEmpty}${c.reset}`);
   
   if (errors.length > 0) {
-    console.log(`Total Errors:   ${errors.length}`);
-    console.log(`\nErrors encountered:`);
-    errors.forEach(e => console.log(`- ${e}`));
+    console.log(`${c.red}Total Errors:   ${errors.length}${c.reset}`);
+    console.log(`\n${c.red}Errors encountered:${c.reset}`);
+    errors.forEach(e => console.log(`${c.red}- ${e}${c.reset}`));
   } else {
-    console.log(`Total Errors:   0`);
+    console.log(`${c.gray}Total Errors:   0${c.reset}`);
   }
-  console.log(`--------------------------------------------------`);
+  console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   
   process.exit(0);
 }
