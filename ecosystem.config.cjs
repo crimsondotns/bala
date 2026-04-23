@@ -4,7 +4,8 @@ module.exports = {
       name: 'solana-token-tracker',
       script: './solana.js',
       instances: 1,
-      autorestart: true,
+      autorestart: false,
+      cron_restart: '*/5 * * * *', // Run every 5 minutes
       watch: false,
       max_memory_restart: '500M',
       env: {
@@ -19,7 +20,8 @@ module.exports = {
       name: 'evm-token-tracker',
       script: './evm.js',
       instances: 1,
-      autorestart: true,
+      autorestart: false,
+      cron_restart: '*/5 * * * *', // Run every 5 minutes
       watch: false,
       max_memory_restart: '500M',
       env: {

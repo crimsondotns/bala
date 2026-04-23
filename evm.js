@@ -7,14 +7,14 @@ dotenv.config();
 
 // 1. CONFIGURATION (Strictly Environment Variables)
 const RPC_CONFIG_RAW = process.env.RPC_CONFIG;
-const WALLETS_RAW = process.env.WALLETS_RAW || process.env.EVM_WALLETS_RAW;
-const ALL_ERC20_TOKENS_RAW = process.env.ALL_ERC20_TOKENS;
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const REDIS_URL = process.env.REDIS_URL;
 
 const SHEET_TAB_NAME = 'EVM_Tracker';
+const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
+const SUBSCRIPTION_ERC20_TAB = 'SUBSCRIPTION ERC20';
 const SHEET_HEADERS = ['Tokens Name', 'Network', 'Tokens Address', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const MULTICALL_BATCH_SIZE = 500;
@@ -72,30 +72,16 @@ function formatDate(date) {
 async function main() {
   const startTime = Date.now();
 
-  if (!RPC_CONFIG_RAW || !WALLETS_RAW || !ALL_ERC20_TOKENS_RAW || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID || !REDIS_URL) {
+  if (!RPC_CONFIG_RAW || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID || !REDIS_URL) {
     console.error('Fatal Error: Missing required environment variables.');
     process.exit(1);
   }
 
-  let RPC_URLS, WALLETS, TOKENS;
+  let RPC_URLS;
   try {
     RPC_URLS = JSON.parse(RPC_CONFIG_RAW);
-    let rawWallets = WALLETS_RAW.trim();
-    if (!rawWallets.startsWith('[')) {
-      rawWallets = rawWallets.replace(/,\s*$/, '');
-      rawWallets = `[${rawWallets}]`;
-    }
-    const parsedWallets = new Function('return ' + rawWallets)();
-    WALLETS = parsedWallets.filter(w => w.address && isAddress(w.address));
-    const parsedTokens = JSON.parse(ALL_ERC20_TOKENS_RAW);
-    TOKENS = parsedTokens.filter(t => t && isAddress(t));
   } catch (err) {
-    console.error('Fatal Error: JSON Parsing failed for configuration.', err.message);
-    process.exit(1);
-  }
-
-  if (WALLETS.length === 0 || TOKENS.length === 0) {
-    console.error('Fatal Error: Wallets or Tokens array is empty after validation.');
+    console.error('Fatal Error: JSON Parsing failed for RPC_CONFIG.', err.message);
     process.exit(1);
   }
 
@@ -128,6 +114,73 @@ async function main() {
     process.exit(1);
   }
 
+  // Load Wallets from SUBSCRIPTION WALLET (Col E & F)
+  const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
+  if (!walletSheet) {
+    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.`);
+    process.exit(1);
+  }
+
+  let WALLETS = [];
+  try {
+    const maxRows = walletSheet.rowCount;
+    if (maxRows >= 3) {
+      await walletSheet.loadCells(`E1:F${maxRows}`);
+      for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
+        const nameCell = walletSheet.getCell(r, 4); // Column E
+        const addrCell = walletSheet.getCell(r, 5); // Column F
+        
+        const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+        const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
+
+        if (addrVal && isAddress(addrVal)) {
+          WALLETS.push({ name: nameVal, address: addrVal });
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_WALLET_TAB}.`, err.message);
+    process.exit(1);
+  }
+
+  if (WALLETS.length === 0) {
+    console.error('Fatal Error: Wallets array is empty after validation from Google Sheets.');
+    process.exit(1);
+  }
+
+  // Load Tokens from SUBSCRIPTION ERC20 (Col C)
+  const tokenSheet = doc.sheetsByTitle[SUBSCRIPTION_ERC20_TAB];
+  if (!tokenSheet) {
+    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_ERC20_TAB}' not found.`);
+    process.exit(1);
+  }
+
+  let TOKENS = [];
+  try {
+    const maxRows = tokenSheet.rowCount;
+    if (maxRows >= 3) {
+      await tokenSheet.loadCells(`C1:C${maxRows}`);
+      for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
+        const addrCell = tokenSheet.getCell(r, 2); // Column C
+        
+        const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+
+        if (addrVal && isAddress(addrVal)) {
+          TOKENS.push(addrVal);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_ERC20_TAB}.`, err.message);
+    process.exit(1);
+  }
+
+  if (TOKENS.length === 0) {
+    console.error('Fatal Error: Tokens array is empty after validation from Google Sheets.');
+    process.exit(1);
+  }
+
+  // Load existing data for Cache-Driven Upsert
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
@@ -139,7 +192,6 @@ async function main() {
     }
   }
 
-  // Load existing data for Cache-Driven Upsert
   let existingRows;
   try {
     existingRows = await sheet.getRows();
@@ -158,7 +210,7 @@ async function main() {
     if (wAddr && net && tAddr) {
       const uniqueKey = `${wAddr}_${net}_${tAddr}`.toLowerCase();
       cacheMap.set(uniqueKey, {
-        rowIdx: row.rowIndex - 1, // 0-based index for getCell
+        rowIdx: row.rowNumber - 1, // 0-based index for getCell
         amount: amt
       });
     }

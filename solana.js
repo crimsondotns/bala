@@ -6,7 +6,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // 1. CONFIGURATION (Strictly Environment Variables)
-const WALLETS_RAW = process.env.WALLETS_RAW;
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || 'https://solana-rpc.publicnode.com';
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
@@ -14,6 +13,7 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
 const SHEET_TAB_NAME = 'Solana_Tracker';
 const SUBSCRIPTION_SPL_TAB = 'SUBSCRIPTION SPL';
+const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // Utility
@@ -37,55 +37,11 @@ function formatDate(date) {
 async function main() {
   const startTime = Date.now();
 
-  if (!WALLETS_RAW || !RPC_ENDPOINT || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
+  if (!RPC_ENDPOINT || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
     console.error('Fatal Error: Missing required environment variables.');
     process.exit(1);
   }
 
-  let WALLETS;
-  try {
-    let rawWallets = WALLETS_RAW.trim();
-    if (!rawWallets.startsWith('[')) {
-      // Remove trailing comma if present to ensure valid array
-      rawWallets = rawWallets.replace(/,\s*$/, '');
-      rawWallets = `[${rawWallets}]`;
-    }
-    const parsedWallets = new Function('return ' + rawWallets)();
-    WALLETS = [];
-    for (const w of parsedWallets) {
-      try {
-        new PublicKey(w.address);
-        WALLETS.push(w);
-      } catch (e) { }
-    }
-  } catch (err) {
-    console.error('Fatal Error: Parsing failed for WALLETS_RAW.', err.message);
-    process.exit(1);
-  }
-
-  if (WALLETS.length === 0) {
-    console.error('Fatal Error: Wallets array is empty after validation.');
-    process.exit(1);
-  }
-
-  // 1. Jupiter API Metadata
-  const tokenMap = new Map();
-  try {
-    const response = await fetch('https://api.jup.ag/tokens/v1/tagged/verified', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json'
-      }
-    });
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-    const data = await response.json();
-    const tokenArray = Array.isArray(data) ? data : (data.tokens || []);
-    tokenArray.forEach(token => {
-      tokenMap.set(token.address, token.symbol);
-    });
-  } catch (error) {
-    console.error('Warning: Failed to fetch Jupiter token list:', error.message);
-  }
 
   // 2. Google Sheets Init
   const serviceAccountAuth = new JWT({
@@ -102,7 +58,46 @@ async function main() {
     process.exit(1);
   }
 
-  // 3. Load Tokens from SUBSCRIPTION SPL
+  // 3. Load Wallets from SUBSCRIPTION WALLET
+  const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
+  if (!walletSheet) {
+    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.`);
+    process.exit(1);
+  }
+
+  let WALLETS = [];
+  try {
+    const maxRows = walletSheet.rowCount;
+    if (maxRows >= 3) {
+      await walletSheet.loadCells(`A1:B${maxRows}`);
+      for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
+        const nameCell = walletSheet.getCell(r, 0); // Column A
+        const addrCell = walletSheet.getCell(r, 1); // Column B
+        
+        const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+        const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
+
+        if (addrVal) {
+          try {
+            new PublicKey(addrVal); // Validate Solana address
+            WALLETS.push({ name: nameVal, address: addrVal });
+          } catch (e) {
+            // Invalid address, skip
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_WALLET_TAB}.`, err.message);
+    process.exit(1);
+  }
+
+  if (WALLETS.length === 0) {
+    console.error('Fatal Error: Wallets array is empty after validation from Google Sheets.');
+    process.exit(1);
+  }
+
+  // 4. Load Tokens from SUBSCRIPTION SPL
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
   if (!subsSheet) {
     console.error(`Fatal Error: Sheet '${SUBSCRIPTION_SPL_TAB}' not found.`);
@@ -114,7 +109,7 @@ async function main() {
     const maxRows = subsSheet.rowCount;
     if (maxRows >= 2) {
       await subsSheet.loadCells(`A1:C${maxRows}`);
-      for (let r = 1; r < maxRows; r++) { // Assume row 1 is header
+      for (let r = 1; r < maxRows; r++) { // Assume row 2 is index 1
         const symCell = subsSheet.getCell(r, 0); // Column A
         const mintCell = subsSheet.getCell(r, 2); // Column C
 
@@ -134,7 +129,6 @@ async function main() {
           try {
             new PublicKey(m);
             tokensToTrack.push({ symbol: symVal, mint: m });
-            if (symVal && !tokenMap.has(m)) tokenMap.set(m, symVal);
           } catch (e) {
             // Invalid mint
           }
@@ -151,7 +145,7 @@ async function main() {
     process.exit(1);
   }
 
-  // 4. Cache-Driven Upsert from Solana_Tracker
+  // 5. Cache-Driven Upsert from Solana_Tracker
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
@@ -180,7 +174,7 @@ async function main() {
     if (wAddr && tMint) {
       const uniqueKey = `${wAddr}_${tMint}`;
       cacheMap.set(uniqueKey, {
-        rowIdx: row.rowIndex - 1, // 0-based index for getCell
+        rowIdx: row.rowNumber - 1, // 0-based index for getCell
         amount: amt
       });
     }
@@ -194,7 +188,7 @@ async function main() {
     process.exit(1);
   }
 
-  // 5. Build Requests
+  // 6. Build Requests
   const requests = [];
   for (const wallet of WALLETS) {
     for (const token of tokensToTrack) {
@@ -207,13 +201,13 @@ async function main() {
           ataAddress: ata.toString(),
           wallet,
           tokenMint: token.mint,
-          tokenSymbol: token.symbol || tokenMap.get(token.mint) || 'Unknown'
+          tokenSymbol: token.symbol || 'Unknown'
         });
       } catch (e) { }
     }
   }
 
-  // 6. Bulk Processing
+  // 7. Bulk Processing
   console.log(`\n>> Network: SOLANA`);
   
   let totalAdded = 0;
@@ -230,7 +224,7 @@ async function main() {
     process.stdout.write(`[${String(c + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}] Processing ${batch500.length} ATAs... `);
     
     let added = 0, updated = 0, idle = 0;
-    const subChunks = chunkArray(batch500, 100);
+    const subChunks = chunkArray(batch500, 10);
 
     for (let s = 0; s < subChunks.length; s++) {
       const subChunk = subChunks[s];
@@ -294,7 +288,7 @@ async function main() {
     console.log(`+ Added: ${added} | ~ Updated: ${updated} | . Idle: ${idle}`);
   }
 
-  // 7. Batch Write
+  // 8. Batch Write
   if (totalUpdated > 0) {
     try {
       await sheet.saveUpdatedCells();
@@ -333,10 +327,6 @@ async function main() {
   }
   console.log(`--------------------------------------------------`);
   
-  if (errors.length > 0) {
-    // If fatal error, it should exit(1). But for partial RPC errors, process.exit(0) is acceptable to not fail the pipeline entirely.
-    // GitHub actions might want to know if there's any error, but the instruction says process.exit(0) on success or process.exit(1) on fatal error.
-  }
   process.exit(0);
 }
 
