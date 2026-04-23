@@ -261,9 +261,11 @@ async function main() {
   const connection = new Connection(RPC_ENDPOINT, 'confirmed');
   const mainChunks = chunkArray(requests, 500);
 
-  for (let c = 0; c < mainChunks.length; c++) {
-    const batch500 = mainChunks[c];
-    process.stdout.write(`${c.gray}[${String(c + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}]${c.reset} Processing ${batch500.length} ATAs... `);
+  for (let chunkIdx = 0; chunkIdx < mainChunks.length; chunkIdx++) {
+    const batch500 = mainChunks[chunkIdx];
+    const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}]${c.reset}`;
+    const processInfo = `Processing ${String(batch500.length).padStart(3, ' ')} ATAs... `;
+    process.stdout.write(`   ${batchInfo} ${processInfo} `);
     
     let added = 0, updated = 0, idle = 0, empty = 0;
     const subChunks = chunkArray(batch500, 10);
@@ -319,7 +321,7 @@ async function main() {
           }
         }
       } catch (err) {
-        errors.push(`Batch ${c+1}.${s+1} failed: ${err.message}`);
+        errors.push(`Batch ${chunkIdx+1}.${s+1} failed: ${err.message}`);
       }
 
       if (s < subChunks.length - 1) {
@@ -327,9 +329,17 @@ async function main() {
       }
     }
     
-    const addedText = added > 0 ? `${c.green}+ Added: ${added}${c.reset}` : `${c.gray}+ Added: ${added}${c.reset}`;
-    const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updated}${c.reset}` : `${c.gray}~ Updated: ${updated}${c.reset}`;
-    console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}| . Idle: ${idle} | 0 Empty: ${empty}${c.reset}`);
+    const addedPad = String(added).padStart(2, '0');
+    const updatedPad = String(updated).padStart(2, '0');
+    const idlePad = String(idle).padStart(3, '0');
+    const emptyPad = String(empty).padStart(3, '0');
+
+    const addedText = added > 0 ? `${c.green}+ Added: ${addedPad}${c.reset}` : `${c.gray}+ Added: ${addedPad}${c.reset}`;
+    const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updatedPad}${c.reset}` : `${c.gray}~ Updated: ${updatedPad}${c.reset}`;
+    const idleText = `${c.gray}. Idle: ${idlePad}${c.reset}`;
+    const emptyText = `${c.gray}0 Empty: ${emptyPad}${c.reset}`;
+    
+    console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}|${c.reset} ${idleText} ${c.gray}|${c.reset} ${emptyText}`);
   }
 
   // 8. Batch Write

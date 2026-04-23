@@ -260,7 +260,7 @@ async function main() {
   const networks = Object.keys(RPC_URLS);
 
   for (const network of networks) {
-    console.log(`\n${c.cyan}${c.bright}>> Network: ${network}${c.reset}`);
+    console.log(`\n${c.cyan}${c.bright}>> Network: ${network.toUpperCase()}${c.reset}`);
     const rpcUrl = RPC_URLS[network];
     const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
     const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
@@ -325,12 +325,14 @@ async function main() {
     const balChunks = chunkArray(balanceCalls, MULTICALL_BATCH_SIZE);
     const mapChunks = chunkArray(callMappings, MULTICALL_BATCH_SIZE);
 
-    for (let c = 0; c < balChunks.length; c++) {
-      const chunk = balChunks[c];
-      const mapping = mapChunks[c];
+    for (let chunkIdx = 0; chunkIdx < balChunks.length; chunkIdx++) {
+      const chunk = balChunks[chunkIdx];
+      const mapping = mapChunks[chunkIdx];
       let added = 0, updated = 0, idle = 0, empty = 0;
 
-      process.stdout.write(`${c.gray}[${String(c + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset} Processing ${chunk.length} calls... `);
+      const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset}`;
+      const processInfo = `Processing ${String(chunk.length).padStart(3, ' ')} calls...`;
+      process.stdout.write(`   ${batchInfo} ${processInfo} `);
 
       try {
         const results = await multicall.aggregate3.staticCall(chunk);
@@ -388,9 +390,17 @@ async function main() {
           }
         }
         
-        const addedText = added > 0 ? `${c.green}+ Added: ${added}${c.reset}` : `${c.gray}+ Added: ${added}${c.reset}`;
-        const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updated}${c.reset}` : `${c.gray}~ Updated: ${updated}${c.reset}`;
-        console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}| . Idle: ${idle} | 0 Empty: ${empty}${c.reset}`);
+        const addedPad = String(added).padStart(2, '0');
+        const updatedPad = String(updated).padStart(2, '0');
+        const idlePad = String(idle).padStart(3, '0');
+        const emptyPad = String(empty).padStart(3, '0');
+
+        const addedText = added > 0 ? `${c.green}+ Added: ${addedPad}${c.reset}` : `${c.gray}+ Added: ${addedPad}${c.reset}`;
+        const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updatedPad}${c.reset}` : `${c.gray}~ Updated: ${updatedPad}${c.reset}`;
+        const idleText = `${c.gray}. Idle: ${idlePad}${c.reset}`;
+        const emptyText = `${c.gray}0 Empty: ${emptyPad}${c.reset}`;
+        
+        console.log(`${addedText} ${c.gray}|${c.reset} ${updatedText} ${c.gray}|${c.reset} ${idleText} ${c.gray}|${c.reset} ${emptyText}`);
       } catch (err) {
         console.log(`${c.red}FAILED!${c.reset}`);
         const errMsg = err.shortMessage || err.message.split(' (')[0];
