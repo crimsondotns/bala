@@ -1,4 +1,4 @@
-name: token worker
+name: evm worker
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch: # ปุ่มกดรันเองมือจากหน้า GitHub
 
 jobs:
-  run-tracker:
+  run-evm:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -26,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Run EVM
+      - name: Run evm
         run: node evm.js
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
