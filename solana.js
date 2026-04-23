@@ -69,122 +69,118 @@ async function main() {
   }
 
   // Load RPC_ENDPOINT from 'nodes' tab
-  const nodesSheet = doc.sheetsByTitle['nodes'];
-  if (!nodesSheet) {
-    console.error("Fatal Error: Sheet 'nodes' not found.");
-    process.exit(1);
-  }
-
   let RPC_ENDPOINT = '';
-  try {
-    const maxRows = nodesSheet.rowCount;
-    if (maxRows >= 2) {
-      await nodesSheet.loadCells(`A1:B${maxRows}`);
-      for (let r = 1; r < maxRows; r++) {
-        const netCell = nodesSheet.getCell(r, 0);
-        const urlCell = nodesSheet.getCell(r, 1);
-        if (netCell && netCell.value && String(netCell.value).trim().toLowerCase() === 'solana') {
-          RPC_ENDPOINT = urlCell && urlCell.value ? String(urlCell.value).trim() : '';
-          break;
+  const nodesSheet = doc.sheetsByTitle['nodes'];
+  if (nodesSheet) {
+    try {
+      const maxRows = nodesSheet.rowCount;
+      if (maxRows >= 2) {
+        await nodesSheet.loadCells(`A1:B${maxRows}`);
+        for (let r = 1; r < maxRows; r++) {
+          const netCell = nodesSheet.getCell(r, 0);
+          const urlCell = nodesSheet.getCell(r, 1);
+          if (netCell && netCell.value && String(netCell.value).trim().toLowerCase() === 'solana') {
+            RPC_ENDPOINT = urlCell && urlCell.value ? String(urlCell.value).trim() : '';
+            break;
+          }
         }
       }
+    } catch (err) {
+      console.log(`${c.red}Warning: Failed to read from 'nodes' tab: ${err.message}${c.reset}`);
     }
-  } catch (err) {
-    console.error("Fatal Error: Failed to read from 'nodes' tab.", err.message);
-    process.exit(1);
+  } else {
+    console.log(`${c.yellow}Warning: Sheet 'nodes' not found.${c.reset}`);
   }
 
   if (!RPC_ENDPOINT) {
-    console.error("Fatal Error: Solana RPC not found in 'nodes' tab.");
-    process.exit(1);
+    console.log(`${c.red}No Solana RPC found in 'nodes' tab. Exiting.${c.reset}`);
+    process.exit(0);
   }
 
   // 3. Load Wallets from SUBSCRIPTION WALLET
-  const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
-  if (!walletSheet) {
-    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.`);
-    process.exit(1);
-  }
-
   let WALLETS = [];
-  try {
-    const maxRows = walletSheet.rowCount;
-    if (maxRows >= 3) {
-      await walletSheet.loadCells(`A1:B${maxRows}`);
-      for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
-        const nameCell = walletSheet.getCell(r, 0); // Column A
-        const addrCell = walletSheet.getCell(r, 1); // Column B
-        
-        const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
-        const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
+  const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
+  if (walletSheet) {
+    try {
+      const maxRows = walletSheet.rowCount;
+      if (maxRows >= 3) {
+        await walletSheet.loadCells(`A1:B${maxRows}`);
+        for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
+          const nameCell = walletSheet.getCell(r, 0); // Column A
+          const addrCell = walletSheet.getCell(r, 1); // Column B
+          
+          const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+          const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
 
-        if (addrVal) {
-          try {
-            new PublicKey(addrVal); // Validate Solana address
-            WALLETS.push({ name: nameVal, address: addrVal });
-          } catch (e) {
-            // Invalid address, skip
+          if (addrVal) {
+            try {
+              new PublicKey(addrVal); // Validate Solana address
+              WALLETS.push({ name: nameVal, address: addrVal });
+            } catch (e) {
+              // Invalid address, skip
+            }
           }
         }
       }
+    } catch (err) {
+      console.log(`${c.red}Warning: Failed to read from ${SUBSCRIPTION_WALLET_TAB}: ${err.message}${c.reset}`);
     }
-  } catch (err) {
-    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_WALLET_TAB}.`, err.message);
-    process.exit(1);
+  } else {
+    console.log(`${c.yellow}Warning: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.${c.reset}`);
   }
 
   if (WALLETS.length === 0) {
-    console.error('Fatal Error: Wallets array is empty after validation from Google Sheets.');
-    process.exit(1);
+    console.log(`${c.red}No valid wallets found. Exiting.${c.reset}`);
+    process.exit(0);
   }
+  console.log(`${c.gray}Loaded ${WALLETS.length} wallet(s)${c.reset}`);
 
   // 4. Load Tokens from SUBSCRIPTION SPL
-  const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
-  if (!subsSheet) {
-    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_SPL_TAB}' not found.`);
-    process.exit(1);
-  }
-
   const tokensToTrack = [];
-  try {
-    const maxRows = subsSheet.rowCount;
-    if (maxRows >= 2) {
-      await subsSheet.loadCells(`A1:C${maxRows}`);
-      for (let r = 1; r < maxRows; r++) { // Assume row 2 is index 1
-        const symCell = subsSheet.getCell(r, 0); // Column A
-        const mintCell = subsSheet.getCell(r, 2); // Column C
+  const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
+  if (subsSheet) {
+    try {
+      const maxRows = subsSheet.rowCount;
+      if (maxRows >= 2) {
+        await subsSheet.loadCells(`A1:C${maxRows}`);
+        for (let r = 1; r < maxRows; r++) { // Assume row 2 is index 1
+          const symCell = subsSheet.getCell(r, 0); // Column A
+          const mintCell = subsSheet.getCell(r, 2); // Column C
 
-        let mints = [];
-        const mintRaw = mintCell && mintCell.value ? String(mintCell.value).trim() : '';
-        if (mintRaw) {
-          try {
-             mints = JSON.parse(mintRaw);
-             if (!Array.isArray(mints)) mints = [mintRaw];
-          } catch {
-             mints = [mintRaw];
+          let mints = [];
+          const mintRaw = mintCell && mintCell.value ? String(mintCell.value).trim() : '';
+          if (mintRaw) {
+            try {
+               mints = JSON.parse(mintRaw);
+               if (!Array.isArray(mints)) mints = [mintRaw];
+            } catch {
+               mints = [mintRaw];
+            }
           }
-        }
-        
-        const symVal = symCell && symCell.value ? String(symCell.value).trim() : '';
-        for (const m of mints) {
-          try {
-            new PublicKey(m);
-            tokensToTrack.push({ symbol: symVal, mint: m });
-          } catch (e) {
-            // Invalid mint
+          
+          const symVal = symCell && symCell.value ? String(symCell.value).trim() : '';
+          for (const m of mints) {
+            try {
+              new PublicKey(m);
+              tokensToTrack.push({ symbol: symVal, mint: m });
+            } catch (e) {
+              // Invalid mint
+            }
           }
         }
       }
+    } catch (err) {
+      console.log(`${c.red}Warning: Failed to read from ${SUBSCRIPTION_SPL_TAB}: ${err.message}${c.reset}`);
     }
-  } catch (err) {
-    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_SPL_TAB}.`, err.message);
-    process.exit(1);
+  } else {
+    console.log(`${c.yellow}Warning: Sheet '${SUBSCRIPTION_SPL_TAB}' not found.${c.reset}`);
   }
 
   if (tokensToTrack.length === 0) {
-    console.error(`Fatal Error: No valid tokens found to track.`);
-    process.exit(1);
+    console.log(`${c.red}No valid tokens found to track. Exiting.${c.reset}`);
+    process.exit(0);
   }
+  console.log(`${c.gray}Loaded ${tokensToTrack.length} token(s)${c.reset}`);
 
   // 5. Cache-Driven Upsert from Solana_Tracker
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
@@ -248,7 +244,7 @@ async function main() {
     }
   }
 
-  // 7. Bulk Processing
+  // 7. Bulk Processing with error handling
   console.log(`\n${c.cyan}${c.bright}>> Network: SOLANA${c.reset}`);
   
   let totalAdded = 0;
@@ -258,7 +254,14 @@ async function main() {
   const errors = [];
   const rowsToAdd = [];
 
-  const connection = new Connection(RPC_ENDPOINT, 'confirmed');
+  let connection;
+  try {
+    connection = new Connection(RPC_ENDPOINT, 'confirmed');
+  } catch (err) {
+    console.log(`${c.red}Failed to connect to Solana RPC: ${err.message}. Exiting.${c.reset}`);
+    process.exit(0);
+  }
+
   const mainChunks = chunkArray(requests, 500);
 
   for (let chunkIdx = 0; chunkIdx < mainChunks.length; chunkIdx++) {
@@ -323,6 +326,7 @@ async function main() {
         }
       } catch (err) {
         errors.push(`Batch ${chunkIdx+1}.${s+1} failed: ${err.message}`);
+        console.log(`${c.red}Batch ${chunkIdx+1}.${s+1} failed: ${err.message}${c.reset}`);
       }
 
       if (s < subChunks.length - 1) {

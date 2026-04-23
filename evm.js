@@ -139,71 +139,71 @@ async function main() {
     process.exit(1);
   }
 
-  // Load Wallets from SUBSCRIPTION WALLET (Col E & F)
-  const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
-  if (!walletSheet) {
-    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.`);
-    process.exit(1);
-  }
-
+  // Load Wallets from SUBSCRIPTION WALLET (Col A & B)
   let WALLETS = [];
-  try {
-    const maxRows = walletSheet.rowCount;
-    if (maxRows >= 3) {
-      await walletSheet.loadCells(`E1:F${maxRows}`);
-      for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
-        const nameCell = walletSheet.getCell(r, 4); // Column E
-        const addrCell = walletSheet.getCell(r, 5); // Column F
-        
-        const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
-        const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
+  const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
+  if (walletSheet) {
+    try {
+      const maxRows = walletSheet.rowCount;
+      if (maxRows >= 3) {
+        await walletSheet.loadCells(`A1:B${maxRows}`);
+        for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
+          const nameCell = walletSheet.getCell(r, 0); // Column A
+          const addrCell = walletSheet.getCell(r, 1); // Column B
+          
+          const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+          const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
 
-        if (addrVal && isAddress(addrVal)) {
-          WALLETS.push({ name: nameVal, address: addrVal });
+          if (addrVal && isAddress(addrVal)) {
+            WALLETS.push({ name: nameVal, address: addrVal });
+          }
         }
       }
+    } catch (err) {
+      console.log(`${c.red}Warning: Failed to read wallets from ${SUBSCRIPTION_WALLET_TAB}: ${err.message}${c.reset}`);
     }
-  } catch (err) {
-    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_WALLET_TAB}.`, err.message);
-    process.exit(1);
+  } else {
+    console.log(`${c.yellow}Warning: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.${c.reset}`);
   }
 
   if (WALLETS.length === 0) {
-    console.error('Fatal Error: Wallets array is empty after validation from Google Sheets.');
-    process.exit(1);
+    console.log(`${c.red}No valid wallets found. Exiting.${c.reset}`);
+    process.exit(0);
   }
+  console.log(`${c.gray}Loaded ${WALLETS.length} wallet(s)${c.reset}`);
 
-  // Load Tokens from SUBSCRIPTION ERC20 (Col C)
-  const tokenSheet = doc.sheetsByTitle[SUBSCRIPTION_ERC20_TAB];
-  if (!tokenSheet) {
-    console.error(`Fatal Error: Sheet '${SUBSCRIPTION_ERC20_TAB}' not found.`);
-    process.exit(1);
-  }
-
+  // Load Tokens from SUBSCRIPTION ERC20 (Col A: symbol, B: name, C: address)
   let TOKENS = [];
-  try {
-    const maxRows = tokenSheet.rowCount;
-    if (maxRows >= 3) {
-      await tokenSheet.loadCells(`C1:C${maxRows}`);
-      for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
-        const addrCell = tokenSheet.getCell(r, 2); // Column C
-        
-        const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+  const tokenSheet = doc.sheetsByTitle[SUBSCRIPTION_ERC20_TAB];
+  if (tokenSheet) {
+    try {
+      const maxRows = tokenSheet.rowCount;
+      if (maxRows >= 3) {
+        await tokenSheet.loadCells(`A1:C${maxRows}`);
+        for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
+          const addrCell = tokenSheet.getCell(r, 2); // Column C - Token Address
+          const symCell = tokenSheet.getCell(r, 0); // Column A - Symbol (optional)
+          
+          const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
+          const symVal = (symCell && symCell.value) ? String(symCell.value).trim() : '';
 
-        if (addrVal && isAddress(addrVal)) {
-          TOKENS.push(addrVal);
+          if (addrVal && isAddress(addrVal)) {
+            TOKENS.push({ address: addrVal, symbol: symVal });
+          }
         }
       }
+    } catch (err) {
+      console.log(`${c.red}Warning: Failed to read tokens from ${SUBSCRIPTION_ERC20_TAB}: ${err.message}${c.reset}`);
     }
-  } catch (err) {
-    console.error(`Fatal Error: Failed to read from ${SUBSCRIPTION_ERC20_TAB}.`, err.message);
-    process.exit(1);
+  } else {
+    console.log(`${c.yellow}Warning: Sheet '${SUBSCRIPTION_ERC20_TAB}' not found.${c.reset}`);
   }
 
   if (TOKENS.length === 0) {
-    console.error('Fatal Error: Tokens array is empty after validation from Google Sheets.');
-    process.exit(1);
+    console.log(`${c.red}No valid tokens found. Exiting.${c.reset}`);
+    process.exit(0);
   }
+  console.log(`${c.gray}Loaded ${TOKENS.length} token(s)${c.reset}`);
 
   // Load existing data for Cache-Driven Upsert
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
@@ -259,154 +259,168 @@ async function main() {
 
   const networks = Object.keys(RPC_URLS);
 
+  // Process each network with error handling - skip failed networks
   for (const network of networks) {
-    console.log(`\n${c.cyan}${c.bright}>> Network: ${network.toUpperCase()}${c.reset}`);
-    const rpcUrl = RPC_URLS[network];
-    const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
-    const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
+    try {
+      console.log(`\n${c.cyan}${c.bright}>> Network: ${network.toUpperCase()}${c.reset}`);
+      const rpcUrl = RPC_URLS[network];
+      const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+      const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
 
-    // 1. Resolve Metadata via Multicall (No Redis)
-    const networkTokens = TOKENS.map(token => ({ address: token }));
-    const metaChunks = chunkArray(networkTokens, MULTICALL_BATCH_SIZE / 2); // 2 calls per token
+      // 1. Resolve Metadata via Multicall (No Redis - fetch fresh each run)
+      const networkTokens = TOKENS.map(t => ({ address: t.address, sheetSymbol: t.symbol }));
+      const metaChunks = chunkArray(networkTokens, Math.floor(MULTICALL_BATCH_SIZE / 2));
 
-    for (const chunk of metaChunks) {
-      const metaCalls = [];
-      for (const pt of chunk) {
-        metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("symbol") });
-        metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
-      }
-      try {
-        const results = await multicall.aggregate3.staticCall(metaCalls);
-        for (let i = 0; i < chunk.length; i++) {
-          const pt = chunk[i];
-          const symRes = results[i * 2];
-          const decRes = results[i * 2 + 1];
+      for (const chunk of metaChunks) {
+        const metaCalls = [];
+        for (const pt of chunk) {
+          metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("symbol") });
+          metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
+        }
+        try {
+          const results = await multicall.aggregate3.staticCall(metaCalls);
+          for (let i = 0; i < chunk.length; i++) {
+            const pt = chunk[i];
+            const symRes = results[i * 2];
+            const decRes = results[i * 2 + 1];
 
-          if (symRes.success && decRes.success) {
-            try {
-              pt.symbol = ERC20_INTERFACE.decodeFunctionResult("symbol", symRes.returnData)[0];
-              pt.decimals = Number(ERC20_INTERFACE.decodeFunctionResult("decimals", decRes.returnData)[0]);
-              pt.success = true;
-            } catch (e) {
+            if (symRes.success && decRes.success) {
+              try {
+                pt.symbol = ERC20_INTERFACE.decodeFunctionResult("symbol", symRes.returnData)[0];
+                pt.decimals = Number(ERC20_INTERFACE.decodeFunctionResult("decimals", decRes.returnData)[0]);
+                pt.success = true;
+              } catch (e) {
+                pt.symbol = pt.sheetSymbol || 'Unknown';
+                pt.success = false;
+              }
+            } else {
+              pt.symbol = pt.sheetSymbol || 'Unknown';
               pt.success = false;
             }
-          } else {
-            pt.success = false;
+          }
+        } catch (err) {
+          const errMsg = err.shortMessage || err.message.split(' (')[0];
+          console.log(`${c.gray}   Metadata fetch failed: ${errMsg}${c.reset}`);
+          for (const pt of chunk) { 
+            pt.symbol = pt.sheetSymbol || 'Unknown';
+            pt.success = false; 
           }
         }
-      } catch (err) {
-        const errMsg = err.shortMessage || err.message.split(' (')[0];
-        errors.push(`[${network}] Metadata Multicall failed: ${errMsg}`);
-        for (const pt of chunk) { pt.success = false; }
       }
-    }
 
-    // 2. Fetch Balances
-    const validTokens = networkTokens.filter(t => t.success);
-    if (validTokens.length === 0) {
-      console.log(`No valid tokens found for ${network}.`);
-      continue;
-    }
-
-    const balanceCalls = [];
-    const callMappings = [];
-
-    for (const token of validTokens) {
-      for (const wallet of WALLETS) {
-        balanceCalls.push({
-          target: token.address,
-          allowFailure: true,
-          callData: ERC20_INTERFACE.encodeFunctionData("balanceOf", [wallet.address])
-        });
-        callMappings.push({ token, wallet });
+      // 2. Fetch Balances
+      const validTokens = networkTokens.filter(t => t.success);
+      if (validTokens.length === 0) {
+        console.log(`${c.gray}   No valid tokens with metadata for ${network}. Skipping.${c.reset}`);
+        continue;
       }
-    }
 
-    const balChunks = chunkArray(balanceCalls, MULTICALL_BATCH_SIZE);
-    const mapChunks = chunkArray(callMappings, MULTICALL_BATCH_SIZE);
+      const balanceCalls = [];
+      const callMappings = [];
 
-    for (let chunkIdx = 0; chunkIdx < balChunks.length; chunkIdx++) {
-      const chunk = balChunks[chunkIdx];
-      const mapping = mapChunks[chunkIdx];
-      let added = 0, updated = 0, idle = 0, empty = 0;
+      for (const token of validTokens) {
+        for (const wallet of WALLETS) {
+          balanceCalls.push({
+            target: token.address,
+            allowFailure: true,
+            callData: ERC20_INTERFACE.encodeFunctionData("balanceOf", [wallet.address])
+          });
+          callMappings.push({ token, wallet });
+        }
+      }
 
-      const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset}`;
-      const processInfo = `Processing ${String(chunk.length).padStart(3, ' ')} calls...`;
-      process.stdout.write(`   ${batchInfo} ${processInfo} `);
+      const balChunks = chunkArray(balanceCalls, MULTICALL_BATCH_SIZE);
+      const mapChunks = chunkArray(callMappings, MULTICALL_BATCH_SIZE);
 
-      try {
-        const results = await multicall.aggregate3.staticCall(chunk);
-        
-        for (let k = 0; k < results.length; k++) {
-          const res = results[k];
-          const m = mapping[k];
+      for (let chunkIdx = 0; chunkIdx < balChunks.length; chunkIdx++) {
+        const chunk = balChunks[chunkIdx];
+        const mapping = mapChunks[chunkIdx];
+        let added = 0, updated = 0, idle = 0, empty = 0;
 
-          if (res.success) {
-            try {
-              const balanceWei = ERC20_INTERFACE.decodeFunctionResult("balanceOf", res.returnData)[0];
-              const balanceStr = formatUnits(balanceWei, m.token.decimals);
-              const balanceFloat = parseFloat(balanceStr);
+        const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset}`;
+        const processInfo = `Processing ${String(chunk.length).padStart(3, ' ')} calls...`;
+        process.stdout.write(`   ${batchInfo} ${processInfo} `);
 
-              if (balanceFloat > 0) {
-                const uniqueKey = `${m.wallet.address}_${network}_${m.token.address}`.toLowerCase();
-                const nowStr = formatDate(new Date());
+        try {
+          const results = await multicall.aggregate3.staticCall(chunk);
+          
+          for (let k = 0; k < results.length; k++) {
+            const res = results[k];
+            const m = mapping[k];
 
-                if (cacheMap.has(uniqueKey)) {
-                  const cached = cacheMap.get(uniqueKey);
-                  if (parseFloat(cached.amount) !== balanceFloat) {
-                    // Update
-                    const cellAmount = sheet.getCell(cached.rowIdx, 3);
-                    const cellTimestamp = sheet.getCell(cached.rowIdx, 6);
-                    cellAmount.value = balanceFloat;
-                    cellTimestamp.value = nowStr;
-                    updated++;
-                    totalUpdated++;
-                    cached.amount = balanceFloat;
+            if (res.success) {
+              try {
+                const balanceWei = ERC20_INTERFACE.decodeFunctionResult("balanceOf", res.returnData)[0];
+                const balanceStr = formatUnits(balanceWei, m.token.decimals);
+                const balanceFloat = parseFloat(balanceStr);
+
+                if (balanceFloat > 0) {
+                  const uniqueKey = `${m.wallet.address}_${network}_${m.token.address}`.toLowerCase();
+                  const nowStr = formatDate(new Date());
+
+                  if (cacheMap.has(uniqueKey)) {
+                    const cached = cacheMap.get(uniqueKey);
+                    if (parseFloat(cached.amount) !== balanceFloat) {
+                      // Update
+                      const cellAmount = sheet.getCell(cached.rowIdx, 3);
+                      const cellTimestamp = sheet.getCell(cached.rowIdx, 6);
+                      cellAmount.value = balanceFloat;
+                      cellTimestamp.value = nowStr;
+                      updated++;
+                      totalUpdated++;
+                      cached.amount = balanceFloat;
+                    } else {
+                      idle++;
+                      totalIdle++;
+                    }
                   } else {
-                    idle++;
-                    totalIdle++;
+                    // Add
+                    rowsToAdd.push({
+                      'Tokens Name': m.token.symbol,
+                      'Network': network,
+                      'Tokens Address': m.token.address,
+                      'Amount': balanceFloat,
+                      'Wallet Name': m.wallet.name,
+                      'Wallet Address': m.wallet.address,
+                      'Timestamp': nowStr
+                    });
+                    added++;
+                    totalAdded++;
+                    cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceFloat });
                   }
                 } else {
-                  // Add
-                  rowsToAdd.push({
-                    'Tokens Name': m.token.symbol,
-                    'Network': network,
-                    'Tokens Address': m.token.address,
-                    'Amount': balanceFloat,
-                    'Wallet Name': m.wallet.name,
-                    'Wallet Address': m.wallet.address,
-                    'Timestamp': nowStr
-                  });
-                  added++;
-                  totalAdded++;
-                  cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceFloat });
+                  empty++;
+                  totalEmpty++;
                 }
-              } else {
-                empty++;
-                totalEmpty++;
+              } catch (e) {
+                // Ignore decode fail for successful call
               }
-            } catch (e) {
-              // Ignore decode fail for successful call
             }
           }
+          
+          const addedPad = String(added).padStart(3, '0');
+          const updatedPad = String(updated).padStart(3, '0');
+          const idlePad = String(idle).padStart(3, '0');
+          const emptyPad = String(empty).padStart(3, '0');
+
+          const addedText = added > 0 ? `${c.green}+ Added: ${addedPad}${c.reset}` : `${c.gray}+ Added: ${addedPad}${c.reset}`;
+          const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updatedPad}${c.reset}` : `${c.gray}~ Updated: ${updatedPad}${c.reset}`;
+          const idleText = `${c.gray}. Idle: ${idlePad}${c.reset}`;
+          const emptyText = `${c.gray}o Empty: ${emptyPad}${c.reset}`;
+
+          console.log(`${addedText} | ${updatedText} | ${idleText} | ${emptyText}`);
+        } catch (err) {
+          console.log(`${c.red}FAILED!${c.reset}`);
+          const errMsg = err.shortMessage || err.message.split(' (')[0];
+          errors.push(`[${network}] Batch ${chunkIdx + 1} failed: ${errMsg}`);
         }
-        
-        const addedPad = String(added).padStart(3, '0');
-        const updatedPad = String(updated).padStart(3, '0');
-        const idlePad = String(idle).padStart(3, '0');
-        const emptyPad = String(empty).padStart(3, '0');
-
-        const addedText = added > 0 ? `${c.green}+ Added: ${addedPad}${c.reset}` : `${c.gray}+ Added: ${addedPad}${c.reset}`;
-        const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updatedPad}${c.reset}` : `${c.gray}~ Updated: ${updatedPad}${c.reset}`;
-        const idleText = `${c.gray}. Idle: ${idlePad}${c.reset}`;
-        const emptyText = `${c.gray}o Empty: ${emptyPad}${c.reset}`;
-
-        console.log(`${addedText} | ${updatedText} | ${idleText} | ${emptyText}`);
-      } catch (err) {
-        console.log(`${c.red}FAILED!${c.reset}`);
-        const errMsg = err.shortMessage || err.message.split(' (')[0];
-        errors.push(`[${network}] Batch Multicall failed: ${errMsg}`);
       }
+    } catch (err) {
+      // Network-level error - skip to next network
+      const errMsg = err.shortMessage || err.message.split(' (')[0];
+      console.log(`${c.red}   Network ${network} failed: ${errMsg}. Skipping to next network.${c.reset}`);
+      errors.push(`[${network}] Network failed: ${errMsg}`);
+      continue;
     }
   }
 
