@@ -142,11 +142,16 @@ async function main() {
   // Load Wallets from SUBSCRIPTION WALLET (Col A & B)
   let WALLETS = [];
   const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
+  console.log(`${c.cyan}[DEBUG] Looking for sheet: '${SUBSCRIPTION_WALLET_TAB}'${c.reset}`);
+  console.log(`${c.cyan}[DEBUG] Available sheets: ${Object.keys(doc.sheetsByTitle).join(', ')}${c.reset}`);
+
   if (walletSheet) {
     try {
       const maxRows = walletSheet.rowCount;
+      console.log(`${c.cyan}[DEBUG] Sheet found! Total rows: ${maxRows}${c.reset}`);
       if (maxRows >= 3) {
         await walletSheet.loadCells(`A1:B${maxRows}`);
+        console.log(`${c.cyan}[DEBUG] Loaded cells A1:B${maxRows}${c.reset}`);
         for (let r = 2; r < maxRows; r++) { // Row 3 is index 2
           const nameCell = walletSheet.getCell(r, 0); // Column A
           const addrCell = walletSheet.getCell(r, 1); // Column B
@@ -154,10 +159,15 @@ async function main() {
           const addrVal = (addrCell && addrCell.value && typeof addrCell.value === 'string') ? addrCell.value.trim() : '';
           const nameVal = (nameCell && nameCell.value) ? String(nameCell.value).trim() : 'Unknown Wallet';
 
+          console.log(`${c.gray}[DEBUG] Row ${r + 1}: name='${nameVal}', addr='${addrVal.substring(0, 20)}...', isAddress=${isAddress(addrVal)}${c.reset}`);
+
           if (addrVal && isAddress(addrVal)) {
             WALLETS.push({ name: nameVal, address: addrVal });
+            console.log(`${c.green}[DEBUG] -> Added wallet: ${nameVal}${c.reset}`);
           }
         }
+      } else {
+        console.log(`${c.yellow}[DEBUG] Not enough rows (need >= 3, got ${maxRows})${c.reset}`);
       }
     } catch (err) {
       console.log(`${c.red}Warning: Failed to read wallets from ${SUBSCRIPTION_WALLET_TAB}: ${err.message}${c.reset}`);
@@ -166,6 +176,7 @@ async function main() {
     console.log(`${c.yellow}Warning: Sheet '${SUBSCRIPTION_WALLET_TAB}' not found.${c.reset}`);
   }
 
+  console.log(`${c.cyan}[DEBUG] Total wallets loaded: ${WALLETS.length}${c.reset}`);
   if (WALLETS.length === 0) {
     console.log(`${c.red}No valid wallets found. Exiting.${c.reset}`);
     process.exit(0);
