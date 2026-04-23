@@ -26,15 +26,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Run EVM Tracker
+      - name: Run EVM
         run: node evm.js
-        env:
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-          GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
-
-      - name: Run Solana Tracker
-        run: node solana.js
         env:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
