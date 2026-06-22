@@ -197,7 +197,7 @@ async function main() {
   }
   console.log(`${c.gray}Loaded ${tokensToTrack.length} token(s)${c.reset}`);
 
-  // 5. Cache-Driven Upsert from Solana_Tracker
+  // 5. Setup & Clear Solana_Tracker Sheet
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
@@ -209,36 +209,6 @@ async function main() {
     }
   }
 
-  let existingRows;
-  try {
-    existingRows = await sheet.getRows();
-  } catch (err) {
-    console.error('Fatal Error: Failed to load rows from Google Sheets', err.message);
-    process.exit(1);
-  }
-
-  const cacheMap = new Map();
-  existingRows.forEach(row => {
-    const rawData = row._rawData || [];
-    const tMint = rawData[2];
-    const amt = rawData[3];
-    const wAddr = rawData[5];
-    if (wAddr && tMint) {
-      const uniqueKey = `${wAddr}_${tMint}`;
-      cacheMap.set(uniqueKey, {
-        rowIdx: row.rowNumber - 1, // 0-based index for getCell
-        amount: amt
-      });
-    }
-  });
-
-  try {
-    const maxRowIndex = sheet.rowCount > 0 ? sheet.rowCount : 1;
-    await sheet.loadCells(`A1:G${maxRowIndex}`);
-  } catch (err) {
-    console.error('Fatal Error: Failed to load cells for batch updates', err.message);
-    process.exit(1);
-  }
 
   // 6. Build Requests
   const requests = [];
@@ -307,37 +277,19 @@ async function main() {
 
           const balanceStr = tokenAmount.uiAmountString;
           const balanceFloat = parseFloat(balanceStr);
-          const uniqueKey = `${req.wallet.address}_${req.tokenMint}`;
           const nowStr = formatDate(new Date());
 
-          if (cacheMap.has(uniqueKey)) {
-            const cached = cacheMap.get(uniqueKey);
-            if (parseFloat(cached.amount) !== balanceFloat) {
-              const cellAmount = sheet.getCell(cached.rowIdx, 3);
-              const cellTimestamp = sheet.getCell(cached.rowIdx, 6);
-              cellAmount.value = balanceFloat;
-              cellTimestamp.value = nowStr;
-              updated++;
-              totalUpdated++;
-              cached.amount = balanceFloat;
-            } else {
-              idle++;
-              totalIdle++;
-            }
-          } else {
-            rowsToAdd.push({
-              'Symbol': req.tokenSymbol,
-              'Network': 'Solana',
-              'Token Mint': req.tokenMint,
-              'Amount': balanceFloat,
-              'Wallet Name': req.wallet.name,
-              'Wallet Address': req.wallet.address,
-              'Timestamp': nowStr
-            });
-            added++;
-            totalAdded++;
-            cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceFloat });
-          }
+          rowsToAdd.push({
+            'Symbol': req.tokenSymbol,
+            'Network': 'Solana',
+            'Token Mint': req.tokenMint,
+            'Amount': balanceFloat,
+            'Wallet Name': req.wallet.name,
+            'Wallet Address': req.wallet.address,
+            'Timestamp': nowStr
+          });
+          added++;
+          totalAdded++;
         }
       } catch (err) {
         errors.push(`Batch ${chunkIdx+1}.${s+1} failed: ${err.message}`);
@@ -362,16 +314,17 @@ async function main() {
     console.log(`${addedText} | ${updatedText} | ${idleText} | ${emptyText}`);
   }
 
-  // 8. Batch Write
-  if (totalUpdated > 0) {
-    try {
-      await sheet.saveUpdatedCells();
-    } catch (err) {
-      errors.push(`Failed to save updated cells: ${err.message}`);
-    }
-  }
-
+  // 8. Clear old data & Batch Write new data
   if (rowsToAdd.length > 0) {
+    try {
+      await sheet.clear();
+      await sheet.setHeaderRow(SHEET_HEADERS);
+      console.log(`\n${c.gray}Cleared existing data from ${SHEET_TAB_NAME}${c.reset}`);
+    } catch (err) {
+      console.error('Fatal Error: Failed to clear sheet data', err.message);
+      process.exit(1);
+    }
+
     const newChunks = chunkArray(rowsToAdd, 2000);
     for (const rChunk of newChunks) {
       try {
