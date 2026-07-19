@@ -220,57 +220,16 @@ async function main() {
   }
   console.log(`${c.gray}Loaded ${TOKENS.length} token(s)${c.reset}`);
 
-  // Load existing data for Cache-Driven Upsert
+  // Prepare output sheet (data will be cleared and rewritten after fetching all balances)
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
-  } else {
-    try {
-      await sheet.loadHeaderRow();
-    } catch {
-      await sheet.setHeaderRow(SHEET_HEADERS);
-    }
   }
 
-  let existingRows;
-  try {
-    existingRows = await sheet.getRows();
-  } catch (err) {
-    console.error('Fatal Error: Failed to load rows from Google Sheets', err.message);
-    process.exit(1);
-  }
-
-  const cacheMap = new Map();
-  existingRows.forEach(row => {
-    const rawData = row._rawData || [];
-    const net = rawData[1];
-    const tAddr = rawData[2];
-    const amt = rawData[3];
-    const wAddr = rawData[5];
-    if (wAddr && net && tAddr) {
-      const uniqueKey = `${wAddr}_${net}_${tAddr}`.toLowerCase();
-      cacheMap.set(uniqueKey, {
-        rowIdx: row.rowNumber - 1, // 0-based index for getCell
-        amount: amt
-      });
-    }
-  });
-
-  // Prepare sheet cells for batch updates
-  try {
-    const maxRowIndex = sheet.rowCount > 0 ? sheet.rowCount : 1;
-    await sheet.loadCells(`A1:G${maxRowIndex}`);
-  } catch (err) {
-    console.error('Fatal Error: Failed to load cells for batch updates', err.message);
-    process.exit(1);
-  }
-
-  let totalAdded = 0;
-  let totalUpdated = 0;
-  let totalIdle = 0;
+  let totalFound = 0;
   let totalEmpty = 0;
   const errors = [];
-  const rowsToAdd = [];
+  const allResults = [];
 
   const networks = Object.keys(RPC_URLS);
 
@@ -350,7 +309,7 @@ async function main() {
       for (let chunkIdx = 0; chunkIdx < balChunks.length; chunkIdx++) {
         const chunk = balChunks[chunkIdx];
         const mapping = mapChunks[chunkIdx];
-        let added = 0, updated = 0, idle = 0, empty = 0;
+        let found = 0, empty = 0;
 
         const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset}`;
         const processInfo = `Processing ${String(chunk.length).padStart(3, ' ')} calls...`;
@@ -370,39 +329,18 @@ async function main() {
                 const balanceFloat = parseFloat(balanceStr);
 
                 if (balanceFloat > 0) {
-                  const uniqueKey = `${m.wallet.address}_${network}_${m.token.address}`.toLowerCase();
                   const nowStr = formatDate(new Date());
-
-                  if (cacheMap.has(uniqueKey)) {
-                    const cached = cacheMap.get(uniqueKey);
-                    if (parseFloat(cached.amount) !== balanceFloat) {
-                      // Update
-                      const cellAmount = sheet.getCell(cached.rowIdx, 3);
-                      const cellTimestamp = sheet.getCell(cached.rowIdx, 6);
-                      cellAmount.value = balanceFloat;
-                      cellTimestamp.value = nowStr;
-                      updated++;
-                      totalUpdated++;
-                      cached.amount = balanceFloat;
-                    } else {
-                      idle++;
-                      totalIdle++;
-                    }
-                  } else {
-                    // Add
-                    rowsToAdd.push({
-                      'Tokens Name': m.token.symbol,
-                      'Network': network,
-                      'Tokens Address': m.token.address,
-                      'Amount': balanceFloat,
-                      'Wallet Name': m.wallet.name,
-                      'Wallet Address': m.wallet.address,
-                      'Timestamp': nowStr
-                    });
-                    added++;
-                    totalAdded++;
-                    cacheMap.set(uniqueKey, { rowIdx: -1, amount: balanceFloat });
-                  }
+                  allResults.push({
+                    'Tokens Name': m.token.symbol,
+                    'Network': network,
+                    'Tokens Address': m.token.address,
+                    'Amount': balanceFloat,
+                    'Wallet Name': m.wallet.name,
+                    'Wallet Address': m.wallet.address,
+                    'Timestamp': nowStr
+                  });
+                  found++;
+                  totalFound++;
                 } else {
                   empty++;
                   totalEmpty++;
@@ -413,17 +351,13 @@ async function main() {
             }
           }
           
-          const addedPad = String(added).padStart(3, '0');
-          const updatedPad = String(updated).padStart(3, '0');
-          const idlePad = String(idle).padStart(3, '0');
+          const foundPad = String(found).padStart(3, '0');
           const emptyPad = String(empty).padStart(3, '0');
 
-          const addedText = added > 0 ? `${c.green}+ Added: ${addedPad}${c.reset}` : `${c.gray}+ Added: ${addedPad}${c.reset}`;
-          const updatedText = updated > 0 ? `${c.yellow}~ Updated: ${updatedPad}${c.reset}` : `${c.gray}~ Updated: ${updatedPad}${c.reset}`;
-          const idleText = `${c.gray}. Idle: ${idlePad}${c.reset}`;
-          const emptyText = `${c.gray}o Empty: ${emptyPad}${c.reset}`;
+          const foundText = found > 0 ? `${c.green}✓ Found: ${foundPad}${c.reset}` : `${c.gray}✓ Found: ${foundPad}${c.reset}`;
+          const emptyText = `${c.gray}○ Empty: ${emptyPad}${c.reset}`;
 
-          console.log(`${addedText} | ${updatedText} | ${idleText} | ${emptyText}`);
+          console.log(`${foundText} | ${emptyText}`);
         } catch (err) {
           console.log(`${c.red}FAILED!${c.reset}`);
           const errMsg = err.shortMessage || err.message.split(' (')[0];
@@ -439,27 +373,50 @@ async function main() {
     }
   }
 
-  // 3. Batch Write
-  if (totalUpdated > 0) {
-    try {
-      await sheet.saveUpdatedCells();
-    } catch (err) {
-      errors.push(`Failed to save updated cells: ${err.message}`);
-    }
+  // 3. ClearContent + Bulk Write with Rate Limiting
+  const WRITE_BATCH_SIZE = 500;
+  const RATE_LIMIT_DELAY_MS = 1100; // ~1.1s between writes to stay under 60 req/min
+
+  async function rateLimitDelay() {
+    return new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
   }
 
-  if (rowsToAdd.length > 0) {
-    const newChunks = chunkArray(rowsToAdd, 2000);
-    for (const rChunk of newChunks) {
+  console.log(`\n${c.cyan}${c.bright}>> Writing to Google Sheets...${c.reset}`);
+  console.log(`${c.gray}   Collected ${allResults.length} rows from ${networks.length} network(s)${c.reset}`);
+
+  // Step 1: Clear existing content (values only, preserves sheet)
+  try {
+    console.log(`${c.yellow}   Clearing existing sheet content...${c.reset}`);
+    await sheet.clear();
+    await rateLimitDelay();
+    await sheet.setHeaderRow(SHEET_HEADERS);
+    await rateLimitDelay();
+    console.log(`${c.green}   ✓ Sheet cleared and headers set${c.reset}`);
+  } catch (err) {
+    errors.push(`Failed to clear sheet: ${err.message}`);
+    console.log(`${c.red}   ✗ Failed to clear sheet: ${err.message}${c.reset}`);
+  }
+
+  // Step 2: Bulk write in batches with rate limiting
+  if (allResults.length > 0) {
+    const writeChunks = chunkArray(allResults, WRITE_BATCH_SIZE);
+    for (let i = 0; i < writeChunks.length; i++) {
+      const batch = writeChunks[i];
       try {
-        await sheet.addRows(rChunk);
+        process.stdout.write(`   ${c.gray}[${String(i + 1).padStart(2, '0')}/${String(writeChunks.length).padStart(2, '0')}]${c.reset} Writing ${String(batch.length).padStart(4, ' ')} rows... `);
+        await sheet.addRows(batch);
+        console.log(`${c.green}✓${c.reset}`);
+        if (i < writeChunks.length - 1) {
+          await rateLimitDelay();
+        }
       } catch (err) {
-        errors.push(`Failed to add new rows: ${err.message}`);
+        console.log(`${c.red}✗${c.reset}`);
+        errors.push(`Failed to write batch ${i + 1}: ${err.message}`);
       }
     }
+  } else {
+    console.log(`${c.yellow}   No data to write.${c.reset}`);
   }
-
-
 
   const endTime = Date.now();
   const execSecs = ((endTime - startTime) / 1000).toFixed(2);
@@ -468,10 +425,9 @@ async function main() {
   console.log(`${c.cyan}${c.bright}PROCESS SUMMARY: EVM WORKER${c.reset}`);
   console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   console.log(`Execution Time: ${execSecs} seconds`);
-  console.log(`${c.green}Total Added:    ${totalAdded}${c.reset}`);
-  console.log(`${c.yellow}Total Updated:  ${totalUpdated}${c.reset}`);
-  console.log(`${c.gray}Total Idle:     ${totalIdle}${c.reset}`);
+  console.log(`${c.green}Total Found:    ${totalFound}${c.reset}`);
   console.log(`${c.gray}Total Empty:    ${totalEmpty}${c.reset}`);
+  console.log(`${c.cyan}Total Written:  ${allResults.length}${c.reset}`);
   
   if (errors.length > 0) {
     console.log(`\n${c.red}Errors encountered:${c.reset}`);
