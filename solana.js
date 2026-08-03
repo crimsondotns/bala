@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getAssociatedTokenAddress } from '@solana/spl-token';
+import { getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
@@ -16,7 +16,7 @@ const c = {
   gray: '\x1b[90m'
 };
 
-// 1. CONFIGURATION (Strictly Environment Variables)
+// 1. CONFIGURATION
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -26,17 +26,17 @@ const SUBSCRIPTION_SPL_TAB = 'SUBSCRIPTION SPL';
 const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
-// ✨ NEW: RPC Configuration for Free Endpoints
+// RPC Endpoints สำรองกรณี Public Endpoint ติด Rate Limit
 const RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
-  'https://api.marinade.finance',
-  'https://api.orca.so',
+  'https://solana-rpc.publicnode.com',
   'https://rpc.solflare.com',
+  'https://api.orca.so'
 ];
 
 let currentRPCIndex = 0;
 
-// Utility
+// Utility Functions
 function chunkArray(array, size) {
   const chunked = [];
   for (let i = 0; i < array.length; i += size) {
@@ -50,7 +50,6 @@ function delay(ms) {
 }
 
 function formatDate(date) {
-  // Use Intl.DateTimeFormat for Asia/Bangkok (UTC+7) timezone
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Bangkok',
     year: 'numeric',
@@ -69,49 +68,31 @@ function formatDate(date) {
   return `${partMap.month}/${partMap.day}/${partMap.year} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
 }
 
-// ✨ NEW: Switch RPC on rate limit
 function switchRPC() {
   currentRPCIndex = (currentRPCIndex + 1) % RPC_ENDPOINTS.length;
-  return RPC_ENDPOINTS[currentRPCIndex];
+  console.log(`${c.yellow}Switching RPC to: ${RPC_ENDPOINTS[currentRPCIndex]}${c.reset}`);
+  return new Connection(RPC_ENDPOINTS[currentRPCIndex], 'confirmed');
 }
 
-// ✨ NEW: Get account with retry + RPC fallback
-async function getMultipleAccountsWithRetry(connection, pubkeys, maxRetries = 3) {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      return await connection.getMultipleAccountsInfo(pubkeys);
-    } catch (e) {
-      console.log(`${c.yellow}Attempt ${attempt + 1}/${maxRetries} failed: ${e.message}${c.reset}`);
-      
-      if (attempt === maxRetries - 1) {
-        // ✨ Last resort: switch RPC and throw
-        console.log(`${c.yellow}Switching to alternative RPC...${c.reset}`);
-        throw e;
-      }
-      
-      // Exponential backoff
-      const waitTime = 3000 * Math.pow(1.5, attempt);
-      console.log(`${c.gray}Waiting ${waitTime}ms before retry...${c.reset}`);
-      await delay(waitTime);
-    }
-  }
-}
+// Fetch Accounts With Automatic Retry & RPC Fallback
+async function getMultipleParsedAccountsWithRetry(connectionState, pubkeys, maxRetries = 3) {
+  let conn = connectionState.conn;
 
-// ✨ NEW: Get parsed accounts with retry
-async function getMultipleParsedAccountsWithRetry(connection, pubkeys, maxRetries = 3) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      return await connection.getMultipleParsedAccounts(pubkeys);
+      return await conn.getMultipleParsedAccounts(pubkeys);
     } catch (e) {
-      if (e.message && e.message.includes('429')) {
-        console.log(`${c.yellow}Rate limit hit, waiting longer...${c.reset}`);
-        if (attempt === maxRetries - 1) throw e;
-        await delay(10000 + attempt * 5000); // 10s, 15s, 20s
-      } else if (attempt === maxRetries - 1) {
-        throw e;
-      } else {
+      console.log(`\n${c.yellow}Attempt ${attempt + 1}/${maxRetries} failed: ${e.message}${c.reset}`);
+      
+      if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests'))) {
+        conn = switchRPC();
+        connectionState.conn = conn; // อัปเดต Reference
+        await delay(3000);
+      } else if (attempt < maxRetries - 1) {
         const waitTime = 2000 * Math.pow(1.5, attempt);
         await delay(waitTime);
+      } else {
+        throw e;
       }
     }
   }
@@ -140,7 +121,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Load RPC_ENDPOINT from 'nodes' tab
+  // Load RPC_ENDPOINT from 'nodes' tab if available
   let RPC_ENDPOINT = '';
   const nodesSheet = doc.sheetsByTitle['nodes'];
   if (nodesSheet) {
@@ -163,11 +144,11 @@ async function main() {
   }
 
   if (!RPC_ENDPOINT) {
-    console.log(`${c.yellow}No Solana RPC found in 'nodes' tab. Using default: ${RPC_ENDPOINTS[0]}${c.reset}`);
     RPC_ENDPOINT = RPC_ENDPOINTS[0];
+    console.log(`${c.yellow}No Solana RPC found in 'nodes' tab. Using default: ${RPC_ENDPOINT}${c.reset}`);
   }
 
-  // 3. Load Wallets from SUBSCRIPTION WALLET
+  // 3. Load Wallets
   let WALLETS = [];
   const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
   if (walletSheet) {
@@ -187,7 +168,7 @@ async function main() {
               new PublicKey(addrVal);
               WALLETS.push({ name: nameVal, address: addrVal });
             } catch (e) {
-              // Invalid address, skip
+              // Address ไม่ถูกต้อง ให้ข้ามไป
             }
           }
         }
@@ -203,7 +184,7 @@ async function main() {
   }
   console.log(`${c.gray}Loaded ${WALLETS.length} wallet(s)${c.reset}`);
 
-  // 4. Load Tokens from SUBSCRIPTION SPL
+  // 4. Load Tokens
   const tokensToTrack = [];
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
   if (subsSheet) {
@@ -232,7 +213,7 @@ async function main() {
               new PublicKey(m);
               tokensToTrack.push({ symbol: symVal, mint: m });
             } catch (e) {
-              // Invalid mint
+              // Mint ไม่ถูกต้อง ให้ข้ามไป
             }
           }
         }
@@ -248,7 +229,7 @@ async function main() {
   }
   console.log(`${c.gray}Loaded ${tokensToTrack.length} token(s)${c.reset}`);
 
-  // 5. Setup & Clear Solana_Tracker Sheet
+  // 5. Setup Target Sheet
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
@@ -260,12 +241,12 @@ async function main() {
     }
   }
 
-  // 6. Build Requests
+  // 6. Build Requests (คำนวณ ATA แบบ Sync)
   const requests = [];
   for (const wallet of WALLETS) {
     for (const token of tokensToTrack) {
       try {
-        const ata = await getAssociatedTokenAddress(
+        const ata = getAssociatedTokenAddressSync(
           new PublicKey(token.mint),
           new PublicKey(wallet.address)
         );
@@ -281,7 +262,7 @@ async function main() {
     }
   }
 
-  // 7. Bulk Processing with error handling
+  // 7. Processing Requests
   console.log(`\n${c.cyan}${c.bright}>> Network: SOLANA${c.reset}`);
   console.log(`${c.gray}RPC Endpoint: ${RPC_ENDPOINT}${c.reset}`);
   
@@ -290,93 +271,88 @@ async function main() {
   const errors = [];
   const rowsToAdd = [];
 
-  let connection = new Connection(RPC_ENDPOINT, 'confirmed');
+  const connectionState = { conn: new Connection(RPC_ENDPOINT, 'confirmed') };
 
-  // ✨ OPTIMIZED: Smaller batch sizes to avoid rate limiting
-  const mainChunks = chunkArray(requests, 50);  // ✨ Reduced from 500 to 50
+  // แบ่ง Batch ครั้งละ 50 ATAs (กำลังดีสำหรับ Public RPC)
+  const batches = chunkArray(requests, 50);
 
-  for (let chunkIdx = 0; chunkIdx < mainChunks.length; chunkIdx++) {
-    const batch = mainChunks[chunkIdx];
-    const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(mainChunks.length).padStart(2, '0')}]${c.reset}`;
-    const processInfo = `Processing ${String(batch.length).padStart(3, ' ')} ATAs... `;
-    process.stdout.write(`   ${batchInfo} ${processInfo} `);
-    
-    let added = 0, empty = 0;
-    
-    // ✨ OPTIMIZED: Smaller sub-chunks
-    const subChunks = chunkArray(batch, 3);  // ✨ Reduced from 10 to 3
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    const batchInfo = `${c.gray}[${String(i + 1).padStart(2, '0')}/${String(batches.length).padStart(2, '0')}]${c.reset}`;
+    process.stdout.write(`   ${batchInfo} Processing ${String(batch.length).padStart(3, ' ')} ATAs... `);
 
-    for (let s = 0; s < subChunks.length; s++) {
-      const subChunk = subChunks[s];
-      try {
-        const pubkeys = subChunk.map(req => new PublicKey(req.ataAddress));
-        
-        // ✨ Use retry logic
-        const response = await getMultipleParsedAccountsWithRetry(connection, pubkeys, 3);
+    let added = 0;
+    let empty = 0;
 
-        for (let j = 0; j < response.value.length; j++) {
-          const accountInfo = response.value[j];
-          const req = subChunk[j];
+    try {
+      const pubkeys = batch.map(req => new PublicKey(req.ataAddress));
+      const response = await getMultipleParsedAccountsWithRetry(connectionState, pubkeys, 3);
 
-          if (accountInfo === null) { 
-            empty++; 
-            totalEmpty++; 
-            continue; 
-          }
+      for (let j = 0; j < response.value.length; j++) {
+        const accountInfo = response.value[j];
+        const req = batch[j];
 
-          try {
-            const parsedInfo = accountInfo.data.parsed.info;
-            const tokenAmount = parsedInfo.tokenAmount;
-            
-            if (tokenAmount.uiAmount === 0) { 
-              empty++; 
-              totalEmpty++; 
-              continue; 
-            }
+        // กรณีไม่มี บัญชีบน Solana (Uninitialized ATA)
+        if (!accountInfo) {
+          empty++;
+          totalEmpty++;
+          continue;
+        }
 
-            const balanceStr = tokenAmount.uiAmountString;
-            const balanceFloat = parseFloat(balanceStr);
-            const nowStr = formatDate(new Date());
-
-            rowsToAdd.push({
-              'Symbol': req.tokenSymbol,
-              'Network': 'Solana',
-              'Token Mint': req.tokenMint,
-              'Amount': balanceFloat,
-              'Wallet Name': req.wallet.name,
-              'Wallet Address': req.wallet.address,
-              'Timestamp': nowStr
-            });
-            added++;
-            totalAdded++;
-          } catch (parseErr) {
+        try {
+          // ตรวจสอบว่ามีโครงสร้าง Parsed Data หรือไม่
+          const parsedData = accountInfo.data?.parsed;
+          if (!parsedData || !parsedData.info) {
             empty++;
             totalEmpty++;
+            continue;
           }
-        }
-      } catch (err) {
-        errors.push(`Batch ${chunkIdx+1}.${s+1}: ${err.message}`);
-        console.log(`${c.red}Batch ${chunkIdx+1}.${s+1} failed: ${err.message}${c.reset}`);
-      }
 
-      // ✨ OPTIMIZED: Longer delay between requests
-      if (s < subChunks.length - 1) {
-        await delay(2000);  // ✨ Increased from 1000ms to 2000ms
+          const tokenAmount = parsedData.info.tokenAmount;
+          if (!tokenAmount || tokenAmount.uiAmount === 0 || tokenAmount.uiAmount === null) {
+            empty++;
+            totalEmpty++;
+            continue;
+          }
+
+          const balanceFloat = parseFloat(tokenAmount.uiAmountString || tokenAmount.uiAmount);
+          const nowStr = formatDate(new Date());
+
+          rowsToAdd.push({
+            'Symbol': req.tokenSymbol,
+            'Network': 'Solana',
+            'Token Mint': req.tokenMint,
+            'Amount': balanceFloat,
+            'Wallet Name': req.wallet.name,
+            'Wallet Address': req.wallet.address,
+            'Timestamp': nowStr
+          });
+
+          added++;
+          totalAdded++;
+        } catch (parseErr) {
+          errors.push(`Parse error for ${req.ataAddress}: ${parseErr.message}`);
+          empty++;
+          totalEmpty++;
+        }
       }
+    } catch (batchErr) {
+      errors.push(`Batch ${i + 1} failed: ${batchErr.message}`);
+      console.log(`${c.red}Batch ${i + 1} failed: ${batchErr.message}${c.reset}`);
     }
-    
+
     const addedText = added > 0 ? `${c.green}+ Added: ${String(added).padStart(3, '0')}${c.reset}` : `${c.gray}+ Added: 000${c.reset}`;
     const emptyText = `${c.gray}o Empty: ${String(empty).padStart(3, '0')}${c.reset}`;
 
     console.log(`${addedText} | ${emptyText}`);
 
-    // ✨ Extra delay between major chunks
-    if (chunkIdx < mainChunks.length - 1) {
-      await delay(3000);
+    // พักระหว่าง Batch เล็กน้อยเพื่อไม่ให้โดนบล็อก Rate Limit
+    if (i < batches.length - 1) {
+      await delay(500);
     }
   }
 
-  // 8. Clear old data & Batch Write new data
+  // 8. Clear old data & Write new data to Google Sheets
   if (rowsToAdd.length > 0) {
     try {
       await sheet.clear();
@@ -387,14 +363,16 @@ async function main() {
       process.exit(1);
     }
 
-    const newChunks = chunkArray(rowsToAdd, 2000);
-    for (const rChunk of newChunks) {
+    const writeChunks = chunkArray(rowsToAdd, 500);
+    for (const rChunk of writeChunks) {
       try {
         await sheet.addRows(rChunk);
       } catch (err) {
         errors.push(`Failed to add new rows: ${err.message}`);
       }
     }
+  } else {
+    console.log(`\n${c.yellow}No non-zero balances found to write to sheet.${c.reset}`);
   }
 
   const execSecs = ((Date.now() - startTime) / 1000).toFixed(2);
