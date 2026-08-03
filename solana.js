@@ -1,5 +1,9 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getAssociatedTokenAddress } from '@solana/spl-token';
+import { 
+  getAssociatedTokenAddress, 
+  TOKEN_PROGRAM_ID, 
+  TOKEN_2022_PROGRAM_ID 
+} from '@solana/spl-token';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
@@ -67,7 +71,6 @@ async function main() {
     process.exit(1);
   }
 
-
   // 2. Google Sheets Init
   const serviceAccountAuth = new JWT({
     email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -109,6 +112,15 @@ async function main() {
 
   if (!RPC_ENDPOINT) {
     console.log(`${c.red}No Solana RPC found in 'nodes' tab. Exiting.${c.reset}`);
+    process.exit(0);
+  }
+
+  // Initialize Connection
+  let connection;
+  try {
+    connection = new Connection(RPC_ENDPOINT, 'confirmed');
+  } catch (err) {
+    console.log(`${c.red}Failed to connect to Solana RPC: ${err.message}. Exiting.${c.reset}`);
     process.exit(0);
   }
 
@@ -209,15 +221,39 @@ async function main() {
     }
   }
 
+  // 6. Detect Mint Program IDs & Build Requests
+  console.log(`${c.gray}Detecting Token Program IDs (SPL Standard vs Token-2022)...${c.reset}`);
+  const mintProgramMap = new Map();
 
-  // 6. Build Requests
+  // ดึงข้อมูล Program ID ของ Token Mint ในรูปแบบ Batch (ครั้งละ 100 เหรียญ)
+  const mintChunks = chunkArray(tokensToTrack, 100);
+  for (const chunk of mintChunks) {
+    try {
+      const pubkeys = chunk.map(t => new PublicKey(t.mint));
+      const infos = await connection.getMultipleAccountsInfo(pubkeys);
+      infos.forEach((info, idx) => {
+        const mintAddr = chunk[idx].mint;
+        if (info && info.owner) {
+          mintProgramMap.set(mintAddr, info.owner);
+        } else {
+          mintProgramMap.set(mintAddr, TOKEN_PROGRAM_ID);
+        }
+      });
+    } catch (err) {
+      console.log(`${c.yellow}Warning: Failed to fetch mint program IDs, defaulting to SPL Token standard.${c.reset}`);
+    }
+  }
+
   const requests = [];
   for (const wallet of WALLETS) {
     for (const token of tokensToTrack) {
       try {
+        const programId = mintProgramMap.get(token.mint) || TOKEN_PROGRAM_ID;
         const ata = await getAssociatedTokenAddress(
           new PublicKey(token.mint),
-          new PublicKey(wallet.address)
+          new PublicKey(wallet.address),
+          true, // allowOwnerOffCurve = true (รองรับ PDA / Smart Wallet)
+          programId
         );
         requests.push({
           ataAddress: ata.toString(),
@@ -238,14 +274,6 @@ async function main() {
   let totalEmpty = 0;
   const errors = [];
   const rowsToAdd = [];
-
-  let connection;
-  try {
-    connection = new Connection(RPC_ENDPOINT, 'confirmed');
-  } catch (err) {
-    console.log(`${c.red}Failed to connect to Solana RPC: ${err.message}. Exiting.${c.reset}`);
-    process.exit(0);
-  }
 
   const mainChunks = chunkArray(requests, 500);
 
