@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
@@ -26,7 +26,6 @@ const SUBSCRIPTION_SPL_TAB = 'SUBSCRIPTION SPL';
 const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
-// RPC Endpoints สำรอง
 const RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
@@ -35,15 +34,6 @@ const RPC_ENDPOINTS = [
 ];
 
 let currentRPCIndex = 0;
-
-// Utility Functions
-function chunkArray(array, size) {
-  const chunked = [];
-  for (let i = 0; i < array.length; i += size) {
-    chunked.push(array.slice(i, i + size));
-  }
-  return chunked;
-}
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -74,13 +64,13 @@ function switchRPC() {
   return new Connection(RPC_ENDPOINTS[currentRPCIndex], 'confirmed');
 }
 
-// Fetch Accounts With Automatic Retry & RPC Fallback
-async function getMultipleParsedAccountsWithRetry(connectionState, pubkeys, maxRetries = 3) {
+// Helper query ทั้ง Standard SPL และ Token-2022
+async function getWalletTokenAccountsWithRetry(connectionState, walletPubKey, programId, maxRetries = 3) {
   let conn = connectionState.conn;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      return await conn.getMultipleParsedAccounts(pubkeys);
+      return await conn.getParsedTokenAccountsByOwner(walletPubKey, { programId });
     } catch (e) {
       const isBlocked = e.message && (
         e.message.includes('429') || 
@@ -91,11 +81,10 @@ async function getMultipleParsedAccountsWithRetry(connectionState, pubkeys, maxR
 
       if (isBlocked) {
         conn = switchRPC();
-        connectionState.conn = conn; // อัปเดต Reference
+        connectionState.conn = conn;
         await delay(2000);
       } else if (attempt < maxRetries - 1) {
-        const waitTime = 1500 * Math.pow(1.5, attempt);
-        await delay(waitTime);
+        await delay(1000 * (attempt + 1));
       } else {
         throw e;
       }
@@ -126,7 +115,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Load RPC_ENDPOINT from 'nodes' tab if available
+  // Load RPC_ENDPOINT from 'nodes' tab
   let RPC_ENDPOINT = '';
   const nodesSheet = doc.sheetsByTitle['nodes'];
   if (nodesSheet) {
@@ -150,7 +139,6 @@ async function main() {
 
   if (!RPC_ENDPOINT) {
     RPC_ENDPOINT = RPC_ENDPOINTS[0];
-    console.log(`${c.yellow}No Solana RPC found in 'nodes' tab. Using default: ${RPC_ENDPOINT}${c.reset}`);
   }
 
   // 3. Load Wallets
@@ -173,7 +161,7 @@ async function main() {
               new PublicKey(addrVal);
               WALLETS.push({ name: nameVal, address: addrVal });
             } catch (e) {
-              // Address ไม่ถูกต้อง ให้ข้ามไป
+              // Invalid address, skip
             }
           }
         }
@@ -189,8 +177,8 @@ async function main() {
   }
   console.log(`${c.gray}Loaded ${WALLETS.length} wallet(s)${c.reset}`);
 
-  // 4. Load Tokens
-  const tokensToTrack = [];
+  // 4. Load Tokens & Map สำหรับค้นหาแบบ O(1)
+  const tokenMap = new Map(); // Mint -> Symbol
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
   if (subsSheet) {
     try {
@@ -212,13 +200,13 @@ async function main() {
             }
           }
           
-          const symVal = symCell && symCell.value ? String(symCell.value).trim() : '';
+          const symVal = symCell && symCell.value ? String(symCell.value).trim() : 'Unknown';
           for (const m of mints) {
             try {
               new PublicKey(m);
-              tokensToTrack.push({ symbol: symVal, mint: m });
+              tokenMap.set(m, symVal);
             } catch (e) {
-              // Mint ไม่ถูกต้อง ให้ข้ามไป
+              // Invalid mint, skip
             }
           }
         }
@@ -228,11 +216,11 @@ async function main() {
     }
   }
 
-  if (tokensToTrack.length === 0) {
+  if (tokenMap.size === 0) {
     console.log(`${c.red}No valid tokens found to track. Exiting.${c.reset}`);
     process.exit(0);
   }
-  console.log(`${c.gray}Loaded ${tokensToTrack.length} token(s)${c.reset}`);
+  console.log(`${c.gray}Loaded ${tokenMap.size} token mint(s) to track${c.reset}`);
 
   // 5. Setup Target Sheet
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
@@ -246,146 +234,102 @@ async function main() {
     }
   }
 
-  // 6. Build Requests
-  const requests = [];
-  for (const wallet of WALLETS) {
-    for (const token of tokensToTrack) {
-      try {
-        const ata = getAssociatedTokenAddressSync(
-          new PublicKey(token.mint),
-          new PublicKey(wallet.address)
-        );
-        requests.push({
-          ataAddress: ata.toString(),
-          wallet,
-          tokenMint: token.mint,
-          tokenSymbol: token.symbol || 'Unknown'
-        });
-      } catch (e) {
-        console.log(`${c.yellow}Warning: Cannot derive ATA for ${token.symbol} and wallet ${wallet.name}${c.reset}`);
-      }
-    }
-  }
-
-  // 7. Processing Requests
-  console.log(`\n${c.cyan}${c.bright}>> Network: SOLANA${c.reset}`);
+  // 6. Processing Wallets
+  console.log(`\n${c.cyan}${c.bright}>> Network: SOLANA (Scanning SPL + Token-2022)${c.reset}`);
   console.log(`${c.gray}Initial RPC Endpoint: ${RPC_ENDPOINT}${c.reset}`);
   
   let totalAdded = 0;
-  let totalEmpty = 0;
   const errors = [];
   const rowsToAdd = [];
 
   const connectionState = { conn: new Connection(RPC_ENDPOINT, 'confirmed') };
 
-  // ✨ แก้ไขจุดสำคัญ: ปรับลด Batch Size จาก 50 เหลือ 10 เพื่อไม่ให้โดน 403 Forbidden Block
-  const batches = chunkArray(requests, 10);
+  for (let wIdx = 0; wIdx < WALLETS.length; wIdx++) {
+    const wallet = WALLETS[wIdx];
+    const walletInfo = `${c.gray}[${String(wIdx + 1).padStart(3, '0')}/${String(WALLETS.length).padStart(3, '0')}]${c.reset}`;
+    process.stdout.write(`   ${walletInfo} Scanning ${wallet.name.padEnd(20, ' ')} `);
 
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    const batchInfo = `${c.gray}[${String(i + 1).padStart(3, '0')}/${String(batches.length).padStart(3, '0')}]${c.reset}`;
-    process.stdout.write(`   ${batchInfo} Processing ${String(batch.length).padStart(2, ' ')} ATAs... `);
-
-    let added = 0;
-    let empty = 0;
+    let walletAdded = 0;
 
     try {
-      const pubkeys = batch.map(req => new PublicKey(req.ataAddress));
-      const response = await getMultipleParsedAccountsWithRetry(connectionState, pubkeys, 3);
+      const walletPubKey = new PublicKey(wallet.address);
 
-      for (let j = 0; j < response.value.length; j++) {
-        const accountInfo = response.value[j];
-        const req = batch[j];
+      // ดึงข้อมูลเหรียญทั้ง Standard SPL (TOKEN_PROGRAM_ID) และ Token-2022 (TOKEN_2022_PROGRAM_ID)
+      const [splAccounts, token2022Accounts] = await Promise.all([
+        getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_PROGRAM_ID),
+        getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_2022_PROGRAM_ID)
+      ]);
 
-        if (!accountInfo) {
-          empty++;
-          totalEmpty++;
-          continue;
-        }
+      const allAccounts = [
+        ...(splAccounts?.value || []),
+        ...(token2022Accounts?.value || [])
+      ];
 
+      for (const item of allAccounts) {
         try {
-          const parsedData = accountInfo.data?.parsed;
-          if (!parsedData || !parsedData.info) {
-            empty++;
-            totalEmpty++;
-            continue;
+          const parsedInfo = item.account.data.parsed.info;
+          const mint = parsedInfo.mint;
+          const tokenAmount = parsedInfo.tokenAmount;
+
+          // เช็คว่าเหรียญตรงกับที่เราต้องการติดตามหรือไม่ และยอดต้องมากกว่า 0
+          if (tokenMap.has(mint) && tokenAmount && tokenAmount.uiAmount > 0) {
+            const balanceFloat = parseFloat(tokenAmount.uiAmountString || tokenAmount.uiAmount);
+            const symbol = tokenMap.get(mint);
+            const nowStr = formatDate(new Date());
+
+            rowsToAdd.push({
+              'Symbol': symbol,
+              'Network': 'Solana',
+              'Token Mint': mint,
+              'Amount': balanceFloat,
+              'Wallet Name': wallet.name,
+              'Wallet Address': wallet.address,
+              'Timestamp': nowStr
+            });
+
+            walletAdded++;
+            totalAdded++;
           }
-
-          const tokenAmount = parsedData.info.tokenAmount;
-          if (!tokenAmount || tokenAmount.uiAmount === 0 || tokenAmount.uiAmount === null) {
-            empty++;
-            totalEmpty++;
-            continue;
-          }
-
-          const balanceFloat = parseFloat(tokenAmount.uiAmountString || tokenAmount.uiAmount);
-          const nowStr = formatDate(new Date());
-
-          rowsToAdd.push({
-            'Symbol': req.tokenSymbol,
-            'Network': 'Solana',
-            'Token Mint': req.tokenMint,
-            'Amount': balanceFloat,
-            'Wallet Name': req.wallet.name,
-            'Wallet Address': req.wallet.address,
-            'Timestamp': nowStr
-          });
-
-          added++;
-          totalAdded++;
-        } catch (parseErr) {
-          errors.push(`Parse error for ${req.ataAddress}: ${parseErr.message}`);
-          empty++;
-          totalEmpty++;
+        } catch (e) {
+          // Parse error บนบางบัญชี ให้ข้ามไป
         }
       }
-    } catch (batchErr) {
-      errors.push(`Batch ${i + 1} failed: ${batchErr.message}`);
-      console.log(`${c.red}Batch ${i + 1} failed: ${batchErr.message}${c.reset}`);
+
+      console.log(`${walletAdded > 0 ? c.green : c.gray}+ Found: ${String(walletAdded).padStart(2, '0')} tokens${c.reset}`);
+
+    } catch (err) {
+      errors.push(`Wallet ${wallet.name} (${wallet.address}) failed: ${err.message}`);
+      console.log(`${c.red}Failed: ${err.message}${c.reset}`);
     }
 
-    const addedText = added > 0 ? `${c.green}+ Added: ${String(added).padStart(2, '0')}${c.reset}` : `${c.gray}+ Added: 00${c.reset}`;
-    const emptyText = `${c.gray}o Empty: ${String(empty).padStart(2, '0')}${c.reset}`;
-
-    console.log(`${addedText} | ${emptyText}`);
-
-    // พักเล็กน้อยระหว่าง Batch (200ms)
-    if (i < batches.length - 1) {
-      await delay(200);
-    }
+    // Delay เล็กน้อยระหว่างกระเป๋า
+    await delay(150);
   }
 
-  // 8. Clear old data & Write new data to Google Sheets
+  // 7. Clear old data & Write new data to Google Sheets
   if (rowsToAdd.length > 0) {
     try {
       await sheet.clear();
       await sheet.setHeaderRow(SHEET_HEADERS);
       console.log(`\n${c.gray}Cleared existing data from ${SHEET_TAB_NAME}${c.reset}`);
+      
+      await sheet.addRows(rowsToAdd);
+      console.log(`${c.green}Successfully written ${rowsToAdd.length} row(s) to Google Sheets!${c.reset}`);
     } catch (err) {
-      console.error('Fatal Error: Failed to clear sheet data', err.message);
-      process.exit(1);
-    }
-
-    const writeChunks = chunkArray(rowsToAdd, 500);
-    for (const rChunk of writeChunks) {
-      try {
-        await sheet.addRows(rChunk);
-      } catch (err) {
-        errors.push(`Failed to add new rows: ${err.message}`);
-      }
+      errors.push(`Failed to write rows to sheet: ${err.message}`);
+      console.error(`${c.red}Error writing to Google Sheets: ${err.message}${c.reset}`);
     }
   } else {
-    console.log(`\n${c.yellow}No non-zero balances found to write to sheet.${c.reset}`);
+    console.log(`\n${c.yellow}No matching token balances (> 0) found to write to sheet.${c.reset}`);
   }
 
   const execSecs = ((Date.now() - startTime) / 1000).toFixed(2);
 
   console.log(`\n${c.gray}--------------------------------------------------${c.reset}`);
-  console.log(`${c.cyan}${c.bright}PROCESS SUMMARY: SOLANA WORKER (RPC Optimized)${c.reset}`);
+  console.log(`${c.cyan}${c.bright}PROCESS SUMMARY: SOLANA WORKER (Token-2022 Native)${c.reset}`);
   console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   console.log(`Execution Time: ${execSecs} seconds`);
   console.log(`${c.green}Total Added:    ${totalAdded}${c.reset}`);
-  console.log(`${c.gray}Total Empty:    ${totalEmpty}${c.reset}`);
   
   if (errors.length > 0) {
     console.log(`${c.red}Total Errors:   ${errors.length}${c.reset}`);
