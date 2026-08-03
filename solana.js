@@ -26,7 +26,7 @@ const SUBSCRIPTION_SPL_TAB = 'SUBSCRIPTION SPL';
 const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
-// RPC Endpoints สำรองกรณี Public Endpoint ติด Rate Limit
+// RPC Endpoints สำรอง
 const RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
@@ -70,7 +70,7 @@ function formatDate(date) {
 
 function switchRPC() {
   currentRPCIndex = (currentRPCIndex + 1) % RPC_ENDPOINTS.length;
-  console.log(`${c.yellow}Switching RPC to: ${RPC_ENDPOINTS[currentRPCIndex]}${c.reset}`);
+  console.log(`\n${c.yellow}Switching RPC to: ${RPC_ENDPOINTS[currentRPCIndex]}${c.reset}`);
   return new Connection(RPC_ENDPOINTS[currentRPCIndex], 'confirmed');
 }
 
@@ -82,14 +82,19 @@ async function getMultipleParsedAccountsWithRetry(connectionState, pubkeys, maxR
     try {
       return await conn.getMultipleParsedAccounts(pubkeys);
     } catch (e) {
-      console.log(`\n${c.yellow}Attempt ${attempt + 1}/${maxRetries} failed: ${e.message}${c.reset}`);
-      
-      if (e.message && (e.message.includes('429') || e.message.includes('Too Many Requests'))) {
+      const isBlocked = e.message && (
+        e.message.includes('429') || 
+        e.message.includes('403') || 
+        e.message.includes('blocked') || 
+        e.message.includes('Too Many Requests')
+      );
+
+      if (isBlocked) {
         conn = switchRPC();
         connectionState.conn = conn; // อัปเดต Reference
-        await delay(3000);
+        await delay(2000);
       } else if (attempt < maxRetries - 1) {
-        const waitTime = 2000 * Math.pow(1.5, attempt);
+        const waitTime = 1500 * Math.pow(1.5, attempt);
         await delay(waitTime);
       } else {
         throw e;
@@ -241,7 +246,7 @@ async function main() {
     }
   }
 
-  // 6. Build Requests (คำนวณ ATA แบบ Sync)
+  // 6. Build Requests
   const requests = [];
   for (const wallet of WALLETS) {
     for (const token of tokensToTrack) {
@@ -264,7 +269,7 @@ async function main() {
 
   // 7. Processing Requests
   console.log(`\n${c.cyan}${c.bright}>> Network: SOLANA${c.reset}`);
-  console.log(`${c.gray}RPC Endpoint: ${RPC_ENDPOINT}${c.reset}`);
+  console.log(`${c.gray}Initial RPC Endpoint: ${RPC_ENDPOINT}${c.reset}`);
   
   let totalAdded = 0;
   let totalEmpty = 0;
@@ -273,13 +278,13 @@ async function main() {
 
   const connectionState = { conn: new Connection(RPC_ENDPOINT, 'confirmed') };
 
-  // แบ่ง Batch ครั้งละ 50 ATAs (กำลังดีสำหรับ Public RPC)
-  const batches = chunkArray(requests, 50);
+  // ✨ แก้ไขจุดสำคัญ: ปรับลด Batch Size จาก 50 เหลือ 10 เพื่อไม่ให้โดน 403 Forbidden Block
+  const batches = chunkArray(requests, 10);
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
-    const batchInfo = `${c.gray}[${String(i + 1).padStart(2, '0')}/${String(batches.length).padStart(2, '0')}]${c.reset}`;
-    process.stdout.write(`   ${batchInfo} Processing ${String(batch.length).padStart(3, ' ')} ATAs... `);
+    const batchInfo = `${c.gray}[${String(i + 1).padStart(3, '0')}/${String(batches.length).padStart(3, '0')}]${c.reset}`;
+    process.stdout.write(`   ${batchInfo} Processing ${String(batch.length).padStart(2, ' ')} ATAs... `);
 
     let added = 0;
     let empty = 0;
@@ -292,7 +297,6 @@ async function main() {
         const accountInfo = response.value[j];
         const req = batch[j];
 
-        // กรณีไม่มี บัญชีบน Solana (Uninitialized ATA)
         if (!accountInfo) {
           empty++;
           totalEmpty++;
@@ -300,7 +304,6 @@ async function main() {
         }
 
         try {
-          // ตรวจสอบว่ามีโครงสร้าง Parsed Data หรือไม่
           const parsedData = accountInfo.data?.parsed;
           if (!parsedData || !parsedData.info) {
             empty++;
@@ -341,14 +344,14 @@ async function main() {
       console.log(`${c.red}Batch ${i + 1} failed: ${batchErr.message}${c.reset}`);
     }
 
-    const addedText = added > 0 ? `${c.green}+ Added: ${String(added).padStart(3, '0')}${c.reset}` : `${c.gray}+ Added: 000${c.reset}`;
-    const emptyText = `${c.gray}o Empty: ${String(empty).padStart(3, '0')}${c.reset}`;
+    const addedText = added > 0 ? `${c.green}+ Added: ${String(added).padStart(2, '0')}${c.reset}` : `${c.gray}+ Added: 00${c.reset}`;
+    const emptyText = `${c.gray}o Empty: ${String(empty).padStart(2, '0')}${c.reset}`;
 
     console.log(`${addedText} | ${emptyText}`);
 
-    // พักระหว่าง Batch เล็กน้อยเพื่อไม่ให้โดนบล็อก Rate Limit
+    // พักเล็กน้อยระหว่าง Batch (200ms)
     if (i < batches.length - 1) {
-      await delay(500);
+      await delay(200);
     }
   }
 
