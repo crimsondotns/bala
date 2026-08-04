@@ -29,22 +29,20 @@ const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================
-// 2. RPC ENDPOINTS (Improved & Prioritized)
+// 2. RPC ENDPOINTS (Optimized & Stable)
 // ============================================
 const RPC_ENDPOINTS = [
-  'https://api.mainnet-beta.solana.com',           // Official Solana
-  'https://solana-api.projectserum.com',           // Project Serum
-  'https://solana-rpc.publicnode.com',             // PublicNode
-  'https://rpc.solflare.com',                      // Solflare
-  'https://api.orca.so',                           // Orca
-  'https://rpc.ankr.com/solana',                   // Ankr
+  'https://api.mainnet-beta.solana.com',                      // Official Solana (Most Reliable)
+  'https://solana-rpc.publicnode.com',                        // PublicNode
+  'https://solana-api.projectserum.com',                      // Project Serum
+  'https://api.triton.one/networks/solana/solana-mainnet',    // Triton
 ];
 
 let currentRPCIndex = 0;
 const RPC_CONFIG = {
-  maxRetries: 6,
-  retryDelayMs: 1000,
-  timeoutMs: 20000,
+  maxRetries: 3,              // Reduced from 6
+  retryDelayMs: 800,
+  timeoutMs: 12000,           // Reduced from 20000
   healthCheckTimeoutMs: 5000
 };
 
@@ -102,7 +100,7 @@ async function checkRPCHealth(endpoint) {
 }
 
 // ============================================
-// 5. RETRY LOGIC WITH EXPONENTIAL BACKOFF
+// 5. RETRY LOGIC WITH SMART BACKOFF
 // ============================================
 
 async function getWalletTokenAccountsWithRetry(connectionState, walletPubKey, programId) {
@@ -142,17 +140,12 @@ async function getWalletTokenAccountsWithRetry(connectionState, walletPubKey, pr
         e.message.includes('ENOTFOUND')
       );
 
-      if (isNetworkError && attempt < RPC_CONFIG.maxRetries - 1) {
-        // Switch RPC and wait with exponential backoff
+      if (attempt < RPC_CONFIG.maxRetries - 1) {
+        // Switch RPC and wait with smart backoff
         conn = switchRPC();
         connectionState.conn = conn;
-        const backoffMs = RPC_CONFIG.retryDelayMs * Math.pow(2, attempt);
-        console.log(`   ${c.dim}Retry ${attempt + 1}/${RPC_CONFIG.maxRetries} after ${backoffMs}ms (elapsed: ${elapsedSecs}s)${c.reset}`);
-        await delay(backoffMs);
-      } else if (attempt < RPC_CONFIG.maxRetries - 1) {
-        // Non-network error, wait shorter
-        const backoffMs = 500 * (attempt + 1);
-        await delay(backoffMs);
+        const waitMs = 800 + (attempt * 500); // 800ms, 1300ms, 1800ms
+        await delay(waitMs);
       }
     }
   }
@@ -371,11 +364,21 @@ async function main() {
     try {
       const walletPubKey = new PublicKey(wallet.address);
 
-      // Fetch both SPL and Token-2022 accounts
-      const [splAccounts, token2022Accounts] = await Promise.all([
-        getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_PROGRAM_ID),
-        getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_2022_PROGRAM_ID)
-      ]);
+      // Fetch both SPL and Token-2022 accounts (with individual error handling)
+      let splAccounts, token2022Accounts;
+      try {
+        splAccounts = await getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_PROGRAM_ID);
+      } catch (err) {
+        console.log(`${c.dim}(SPL fetch failed, continuing with Token-2022)${c.reset}`);
+        splAccounts = { value: [] };
+      }
+
+      try {
+        token2022Accounts = await getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_2022_PROGRAM_ID);
+      } catch (err) {
+        console.log(`${c.dim}(Token-2022 fetch failed, continuing with SPL)${c.reset}`);
+        token2022Accounts = { value: [] };
+      }
 
       const allAccounts = [
         ...(splAccounts?.value || []),
@@ -417,12 +420,12 @@ async function main() {
 
     } catch (err) {
       const errorMsg = err.message.length > 50 ? err.message.substring(0, 50) + '...' : err.message;
-      errors.push(`${wallet.name} (${wallet.address}): ${err.message}`);
+      errors.push(`${wallet.name}: ${err.message}`);
       console.log(`${c.red}✗ ${errorMsg}${c.reset}`);
     }
 
-    // Delay between wallets (increased from 150ms to 500ms)
-    await delay(500);
+    // Delay between wallets (crucial to avoid rate limiting)
+    await delay(1200);
   }
 
   // ============================================
