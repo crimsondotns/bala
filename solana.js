@@ -29,10 +29,10 @@ const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================
-// 2. RPC ENDPOINTS (Optimized & Stable)
+// 2. RPC ENDPOINTS (Optimized for High Volume)
 // ============================================
 const RPC_ENDPOINTS = [
-  'https://api.mainnet-beta.solana.com',                      // Official Solana (Most Reliable)
+  'https://api.mainnet-beta.solana.com',                      // Official Solana
   'https://solana-rpc.publicnode.com',                        // PublicNode
   'https://solana-api.projectserum.com',                      // Project Serum
   'https://api.triton.one/networks/solana/solana-mainnet',    // Triton
@@ -40,11 +40,38 @@ const RPC_ENDPOINTS = [
 
 let currentRPCIndex = 0;
 const RPC_CONFIG = {
-  maxRetries: 3,              // Reduced from 6
-  retryDelayMs: 800,
-  timeoutMs: 12000,           // Reduced from 20000
-  healthCheckTimeoutMs: 5000
+  maxRetries: 1,              // Disable retry (we handle it better)
+  timeoutMs: 15000,
+  healthCheckTimeoutMs: 5000,
+  delayBetweenRequests: 600,  // ms between individual requests
+  delayBetweenWallets: 2500,  // ms between wallets (increased from 1200)
+  requestBatchSize: 10        // Max concurrent Solana requests
 };
+
+// Rate limiter
+class RateLimiter {
+  constructor(maxPerSecond) {
+    this.maxPerSecond = maxPerSecond;
+    this.timestamps = [];
+  }
+
+  async wait() {
+    const now = Date.now();
+    // Remove timestamps older than 1 second
+    this.timestamps = this.timestamps.filter(ts => now - ts < 1000);
+
+    if (this.timestamps.length >= this.maxPerSecond) {
+      const oldestTimestamp = this.timestamps[0];
+      const waitTime = 1000 - (now - oldestTimestamp) + 10; // +10ms buffer
+      await delay(waitTime);
+      this.timestamps.shift();
+    }
+
+    this.timestamps.push(now);
+  }
+}
+
+const rateLimiter = new RateLimiter(40); // Max 40 requests per second
 
 // ============================================
 // 3. UTILITY FUNCTIONS
@@ -100,57 +127,55 @@ async function checkRPCHealth(endpoint) {
 }
 
 // ============================================
-// 5. RETRY LOGIC WITH SMART BACKOFF
+// 5. OPTIMIZED RETRY LOGIC (Sequential + Rate Limited)
 // ============================================
 
-async function getWalletTokenAccountsWithRetry(connectionState, walletPubKey, programId) {
-  let conn = connectionState.conn;
+async function fetchTokenAccountsWithRetry(conn, walletPubKey, programId, programName) {
   let lastError;
-  const startTime = Date.now();
+  let currentConn = conn;
+  let rpcSwitches = 0;
 
-  for (let attempt = 0; attempt < RPC_CONFIG.maxRetries; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      // Create timeout promise
+      // Rate limit before request
+      await rateLimiter.wait();
+      await delay(RPC_CONFIG.delayBetweenRequests);
+
+      // Timeout wrapper
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('RPC timeout')), RPC_CONFIG.timeoutMs)
+        setTimeout(() => reject(new Error('Request timeout')), RPC_CONFIG.timeoutMs)
       );
 
-      // Race between actual call and timeout
       const result = await Promise.race([
-        conn.getParsedTokenAccountsByOwner(walletPubKey, { programId }),
+        currentConn.getParsedTokenAccountsByOwner(walletPubKey, { programId }),
         timeoutPromise
       ]);
 
-      return result;
+      return { success: true, data: result, programName };
 
     } catch (e) {
       lastError = e;
-      const elapsedSecs = ((Date.now() - startTime) / 1000).toFixed(1);
-
-      // Determine if this is a network/RPC error
       const isNetworkError = e.message && (
-        e.message.includes('fetch') ||
         e.message.includes('429') ||
         e.message.includes('403') ||
-        e.message.includes('blocked') ||
-        e.message.includes('Too Many Requests') ||
-        e.message.includes('ECONNREFUSED') ||
-        e.message.includes('ETIMEDOUT') ||
         e.message.includes('timeout') ||
-        e.message.includes('ENOTFOUND')
+        e.message.includes('fetch') ||
+        e.message.includes('ECONNREFUSED')
       );
 
-      if (attempt < RPC_CONFIG.maxRetries - 1) {
-        // Switch RPC and wait with smart backoff
-        conn = switchRPC();
-        connectionState.conn = conn;
-        const waitMs = 800 + (attempt * 500); // 800ms, 1300ms, 1800ms
-        await delay(waitMs);
+      if (isNetworkError && attempt < 2 && rpcSwitches < 2) {
+        // Switch RPC on network error
+        currentConn = switchRPC();
+        rpcSwitches++;
+        await delay(1000 + (attempt * 500));
+      } else if (!isNetworkError && attempt < 2) {
+        // Brief delay for non-network errors
+        await delay(300);
       }
     }
   }
 
-  throw lastError || new Error('Max retries exceeded');
+  return { success: false, error: lastError?.message || 'Max retries exceeded', programName };
 }
 
 // ============================================
@@ -161,13 +186,12 @@ async function main() {
   const startTime = Date.now();
 
   console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║        SOLANA TOKEN TRACKER (Fixed Version)             ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║        SOLANA TOKEN TRACKER (Optimized)                 ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}\n`);
 
   // Validate environment variables
   if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
     console.error(`${c.red}✗ Fatal Error: Missing required environment variables.${c.reset}`);
-    console.error(`  Required: GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, SPREADSHEET_ID`);
     process.exit(1);
   }
 
@@ -188,7 +212,6 @@ async function main() {
     console.log(`${c.green}✓ Google Sheets connected${c.reset}`);
   } catch (err) {
     console.error(`${c.red}✗ Fatal Error: Failed to connect to Google Sheets${c.reset}`);
-    console.error(`  ${err.message}`);
     process.exit(1);
   }
 
@@ -212,7 +235,7 @@ async function main() {
         }
       }
     } catch (err) {
-      console.log(`${c.dim}Warning: Failed to read from 'nodes' tab: ${err.message}${c.reset}`);
+      console.log(`${c.dim}Warning: Failed to read from 'nodes' tab${c.reset}`);
     }
   }
 
@@ -227,8 +250,7 @@ async function main() {
   const healthCheck = await checkRPCHealth(RPC_ENDPOINT);
   
   if (!healthCheck.healthy) {
-    console.log(`${c.yellow}⚠ Primary RPC unhealthy: ${healthCheck.error}${c.reset}`);
-    console.log(`${c.yellow}  Falling back to: ${RPC_ENDPOINTS[0]}${c.reset}`);
+    console.log(`${c.yellow}⚠ Primary RPC unhealthy, using fallback${c.reset}`);
     RPC_ENDPOINT = RPC_ENDPOINTS[0];
   } else {
     console.log(`${c.green}✓ RPC healthy (slot: ${healthCheck.slot})${c.reset}`);
@@ -258,18 +280,18 @@ async function main() {
               new PublicKey(addrVal);
               WALLETS.push({ name: nameVal, address: addrVal });
             } catch (e) {
-              // Invalid address, skip silently
+              // Invalid address, skip
             }
           }
         }
       }
     } catch (err) {
-      console.log(`${c.red}Warning: Failed to read from ${SUBSCRIPTION_WALLET_TAB}: ${err.message}${c.reset}`);
+      console.log(`${c.red}Warning: Failed to read wallets${c.reset}`);
     }
   }
 
   if (WALLETS.length === 0) {
-    console.error(`${c.red}✗ No valid wallets found. Exiting.${c.reset}`);
+    console.error(`${c.red}✗ No valid wallets found.${c.reset}`);
     process.exit(0);
   }
   console.log(`${c.green}✓ Loaded ${WALLETS.length} wallet(s)${c.reset}`);
@@ -279,7 +301,7 @@ async function main() {
   // ============================================
   console.log(`${c.cyan}[4/5] Loading token subscriptions...${c.reset}`);
   
-  const tokenMap = new Map(); // Mint -> Symbol
+  const tokenMap = new Map();
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
   if (subsSheet) {
     try {
@@ -307,18 +329,18 @@ async function main() {
               new PublicKey(m);
               tokenMap.set(m, symVal);
             } catch (e) {
-              // Invalid mint, skip silently
+              // Invalid mint, skip
             }
           }
         }
       }
     } catch (err) {
-      console.log(`${c.red}Warning: Failed to read from ${SUBSCRIPTION_SPL_TAB}: ${err.message}${c.reset}`);
+      console.log(`${c.red}Warning: Failed to read tokens${c.reset}`);
     }
   }
 
   if (tokenMap.size === 0) {
-    console.error(`${c.red}✗ No valid tokens found to track. Exiting.${c.reset}`);
+    console.error(`${c.red}✗ No valid tokens found.${c.reset}`);
     process.exit(0);
   }
   console.log(`${c.green}✓ Loaded ${tokenMap.size} token(s) to track${c.reset}`);
@@ -331,21 +353,20 @@ async function main() {
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
-    console.log(`${c.green}✓ Created new sheet: ${SHEET_TAB_NAME}${c.reset}`);
   } else {
     try {
       await sheet.loadHeaderRow();
-      console.log(`${c.green}✓ Using existing sheet: ${SHEET_TAB_NAME}${c.reset}`);
     } catch {
       await sheet.setHeaderRow(SHEET_HEADERS);
     }
   }
+  console.log(`${c.green}✓ Sheet ready${c.reset}`);
 
   // ============================================
   // 13. PROCESS WALLETS
   // ============================================
-  console.log(`\n${c.cyan}${c.bright}>> Starting scan: SOLANA (SPL + Token-2022)${c.reset}`);
-  console.log(`${c.gray}RPC Endpoint: ${RPC_ENDPOINT}${c.reset}`);
+  console.log(`\n${c.cyan}${c.bright}>> Starting scan: SOLANA (Sequential Fetch Mode)${c.reset}`);
+  console.log(`${c.gray}RPC: ${RPC_ENDPOINT.substring(0, 40)}...${c.reset}`);
   console.log(`${c.gray}Wallets: ${WALLETS.length} | Tokens: ${tokenMap.size}${c.reset}\n`);
   
   let totalAdded = 0;
@@ -364,25 +385,32 @@ async function main() {
     try {
       const walletPubKey = new PublicKey(wallet.address);
 
-      // Fetch both SPL and Token-2022 accounts (with individual error handling)
-      let splAccounts, token2022Accounts;
-      try {
-        splAccounts = await getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_PROGRAM_ID);
-      } catch (err) {
-        console.log(`${c.dim}(SPL fetch failed, continuing with Token-2022)${c.reset}`);
-        splAccounts = { value: [] };
+      // Fetch SPL and Token-2022 SEQUENTIALLY (not in parallel)
+      const splResult = await fetchTokenAccountsWithRetry(
+        connectionState.conn, 
+        walletPubKey, 
+        TOKEN_PROGRAM_ID, 
+        'SPL'
+      );
+
+      if (!splResult.success) {
+        console.log(`${c.dim}(SPL: ${splResult.error?.substring(0, 20)})${c.reset}`);
       }
 
-      try {
-        token2022Accounts = await getWalletTokenAccountsWithRetry(connectionState, walletPubKey, TOKEN_2022_PROGRAM_ID);
-      } catch (err) {
-        console.log(`${c.dim}(Token-2022 fetch failed, continuing with SPL)${c.reset}`);
-        token2022Accounts = { value: [] };
+      const token2022Result = await fetchTokenAccountsWithRetry(
+        connectionState.conn, 
+        walletPubKey, 
+        TOKEN_2022_PROGRAM_ID, 
+        'Token-2022'
+      );
+
+      if (!token2022Result.success) {
+        console.log(`${c.dim}(Token-2022: ${token2022Result.error?.substring(0, 20)})${c.reset}`);
       }
 
       const allAccounts = [
-        ...(splAccounts?.value || []),
-        ...(token2022Accounts?.value || [])
+        ...(splResult.success ? splResult.data?.value || [] : []),
+        ...(token2022Result.success ? token2022Result.data?.value || [] : [])
       ];
 
       for (const item of allAccounts) {
@@ -391,7 +419,6 @@ async function main() {
           const mint = parsedInfo.mint;
           const tokenAmount = parsedInfo.tokenAmount;
 
-          // Check if mint is tracked and has balance > 0
           if (tokenMap.has(mint) && tokenAmount && tokenAmount.uiAmount > 0) {
             const balanceFloat = parseFloat(tokenAmount.uiAmountString || tokenAmount.uiAmount);
             const symbol = tokenMap.get(mint);
@@ -411,7 +438,7 @@ async function main() {
             totalAdded++;
           }
         } catch (e) {
-          // Parse error on specific account, skip
+          // Parse error on account, skip
         }
       }
 
@@ -419,57 +446,52 @@ async function main() {
       console.log(`${statusColor}✓ Found ${String(walletAdded).padStart(2, '0')} tokens${c.reset}`);
 
     } catch (err) {
-      const errorMsg = err.message.length > 50 ? err.message.substring(0, 50) + '...' : err.message;
-      errors.push(`${wallet.name}: ${err.message}`);
-      console.log(`${c.red}✗ ${errorMsg}${c.reset}`);
+      const msg = err.message.substring(0, 40);
+      errors.push(`${wallet.name}: ${msg}`);
+      console.log(`${c.red}✗ ${msg}${c.reset}`);
     }
 
-    // Delay between wallets (crucial to avoid rate limiting)
-    await delay(1200);
+    // Delay between wallets (critical for rate limiting)
+    await delay(RPC_CONFIG.delayBetweenWallets);
   }
 
   // ============================================
   // 14. WRITE TO GOOGLE SHEETS
   // ============================================
-  console.log(`\n${c.cyan}${c.bright}>> Writing results to Google Sheets...${c.reset}`);
+  console.log(`\n${c.cyan}${c.bright}>> Writing to Google Sheets...${c.reset}`);
   
   if (rowsToAdd.length > 0) {
     try {
       await sheet.clear();
       await sheet.setHeaderRow(SHEET_HEADERS);
-      console.log(`${c.gray}Cleared existing data${c.reset}`);
       
       await sheet.addRows(rowsToAdd);
-      console.log(`${c.green}✓ Written ${rowsToAdd.length} row(s) to sheet${c.reset}`);
+      console.log(`${c.green}✓ Written ${rowsToAdd.length} row(s)${c.reset}`);
     } catch (err) {
-      errors.push(`Failed to write rows to sheet: ${err.message}`);
-      console.error(`${c.red}✗ Error writing to Google Sheets: ${err.message}${c.reset}`);
+      errors.push(`Sheet write failed: ${err.message}`);
+      console.error(`${c.red}✗ Error: ${err.message}${c.reset}`);
     }
   } else {
-    console.log(`${c.yellow}⚠ No matching token balances found to write${c.reset}`);
+    console.log(`${c.yellow}⚠ No tokens found${c.reset}`);
   }
 
   // ============================================
-  // 15. SUMMARY REPORT
+  // 15. SUMMARY
   // ============================================
   const execSecs = ((Date.now() - startTime) / 1000).toFixed(2);
 
   console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
   console.log(`${c.cyan}${c.bright}║              EXECUTION SUMMARY                          ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}`);
-  console.log(`${c.gray}Execution Time:        ${execSecs} seconds${c.reset}`);
-  console.log(`${c.gray}Wallets Processed:     ${WALLETS.length}${c.reset}`);
-  console.log(`${c.gray}Tokens Tracked:        ${tokenMap.size}${c.reset}`);
-  console.log(`${c.green}Total Records Added:   ${totalAdded}${c.reset}`);
+  console.log(`Execution Time:        ${execSecs}s`);
+  console.log(`Wallets:               ${WALLETS.length}`);
+  console.log(`Tokens Tracked:        ${tokenMap.size}`);
+  console.log(`${c.green}Total Records:         ${totalAdded}${c.reset}`);
   
   if (errors.length > 0) {
-    console.log(`${c.red}Total Errors:          ${errors.length}${c.reset}`);
-    console.log(`\n${c.red}Errors (showing first 10):${c.reset}`);
-    errors.slice(0, 10).forEach((e, i) => {
-      console.log(`${c.red}  ${i + 1}. ${e}${c.reset}`);
-    });
+    console.log(`${c.red}Errors:                ${errors.length}${c.reset}`);
   } else {
-    console.log(`${c.green}Total Errors:          0${c.reset}`);
+    console.log(`${c.green}Errors:                0${c.reset}`);
   }
   console.log(`${c.cyan}${c.bright}════════════════════════════════════════════════════════${c.reset}\n`);
   
@@ -477,9 +499,9 @@ async function main() {
 }
 
 // ============================================
-// 16. RUN MAIN
+// 16. RUN
 // ============================================
 main().catch(err => {
-  console.error(`${c.red}${c.bright}Fatal Error:${c.reset} ${err.message}`);
+  console.error(`${c.red}Fatal: ${err.message}${c.reset}`);
   process.exit(1);
 });
