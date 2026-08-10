@@ -6,15 +6,9 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const c = {
-  reset: '\x1b[0m',
-  bright: '\x1b[1m',
-  dim: '\x1b[2m',
-  cyan: '\x1b[36m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  red: '\x1b[31m',
-  gray: '\x1b[90m',
-  magenta: '\x1b[35m'
+  reset: '\x1b[0m', bright: '\x1b[1m', dim: '\x1b[2m',
+  cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m',
+  red: '\x1b[31m', gray: '\x1b[90m', magenta: '\x1b[35m'
 };
 
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
@@ -27,17 +21,18 @@ const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================
-// RPC ENDPOINTS - แบ่งตาม Token Type
+// RPC ENDPOINTS
 // ============================================
 
-// 🔹 SPL Tokens - ใช้ได้ทุก node
-const SPL_RPC_ENDPOINTS = [
+// 🔹 SPL / Detect - หลายตัวสลับใช้
+const DETECT_RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
   'https://rpc.ankr.com/solana',
+  'https://solana-api.projectserum.com',
 ];
 
-// 🔹 Token-2022 - ต้องใช้ node ที่รองรับดี
+// 🔹 Token-2022 fetch
 const TOKEN2022_RPC_ENDPOINTS = [
   'https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY',
   'https://solana-mainnet.rpc.extrnode.com',
@@ -45,11 +40,11 @@ const TOKEN2022_RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
 ];
 
-let currentSPLIndex = 0;
+let currentDetectIndex = 0;
 let currentToken2022Index = 0;
-let rpcFailures = { spl: {}, token2022: {} };
+let rpcFailures = { detect: {}, token2022: {} };
 
-SPL_RPC_ENDPOINTS.forEach((_, i) => { rpcFailures.spl[i] = { count: 0, lastFail: null }; });
+DETECT_RPC_ENDPOINTS.forEach((_, i) => { rpcFailures.detect[i] = { count: 0, lastFail: null }; });
 TOKEN2022_RPC_ENDPOINTS.forEach((_, i) => { rpcFailures.token2022[i] = { count: 0, lastFail: null }; });
 
 const CONFIG = {
@@ -59,8 +54,14 @@ const CONFIG = {
   maxRetriesPerWallet: 3,
   rpcHealthCheckInterval: 5,
   batchWriteSize: 500,
-  // 🆕 Cache settings
-  mintTypeCacheExpiry: 30 * 60 * 1000, // 30 minutes
+  mintTypeCacheExpiry: 30 * 60 * 1000,
+  // 🆕 Detect settings
+  detectBatchSize: 3,           // ลดจาก 10 -> 3
+  detectDelayMs: 500,           // เพิ่มจาก 200 -> 500
+  detectTimeoutMs: 10000,
+  detectMaxRetries: 3,
+  // 🆕 getMultipleAccounts batch
+  multiAccountBatchSize: 100,   // 1 RPC call = 100 accounts
 };
 
 function delay(ms) {
@@ -84,7 +85,7 @@ function formatDate(date) {
 // ============================================
 
 function switchToHealthiest(type) {
-  const endpoints = type === 'spl' ? SPL_RPC_ENDPOINTS : TOKEN2022_RPC_ENDPOINTS;
+  const endpoints = type === 'detect' ? DETECT_RPC_ENDPOINTS : TOKEN2022_RPC_ENDPOINTS;
   const failures = rpcFailures[type];
   let bestIndex = 0;
   let lowestFailures = failures[0].count;
@@ -96,7 +97,7 @@ function switchToHealthiest(type) {
     }
   }
 
-  if (type === 'spl') currentSPLIndex = bestIndex;
+  if (type === 'detect') currentDetectIndex = bestIndex;
   else currentToken2022Index = bestIndex;
 
   const endpoint = endpoints[bestIndex];
@@ -105,7 +106,7 @@ function switchToHealthiest(type) {
 }
 
 function recordFailure(type) {
-  const index = type === 'spl' ? currentSPLIndex : currentToken2022Index;
+  const index = type === 'detect' ? currentDetectIndex : currentToken2022Index;
   rpcFailures[type][index].count++;
   rpcFailures[type][index].lastFail = Date.now();
 }
@@ -127,12 +128,12 @@ async function checkRPCHealth(conn) {
 }
 
 // ============================================
-// Fetch Function
+// Fetch Function for wallet scanning
 // ============================================
 
 async function fetchTokenAccountsWithRetry(walletPubKey, programId, tokenType) {
-  const endpoints = tokenType === 'spl' ? SPL_RPC_ENDPOINTS : TOKEN2022_RPC_ENDPOINTS;
-  let currentIndex = tokenType === 'spl' ? currentSPLIndex : currentToken2022Index;
+  const endpoints = tokenType === 'token2022' ? TOKEN2022_RPC_ENDPOINTS : DETECT_RPC_ENDPOINTS;
+  let currentIndex = tokenType === 'token2022' ? currentToken2022Index : currentDetectIndex;
   let attemptConn = new Connection(endpoints[currentIndex], 'confirmed');
   let lastError;
 
@@ -158,9 +159,9 @@ async function fetchTokenAccountsWithRetry(walletPubKey, programId, tokenType) {
       );
 
       if (isNetworkError) {
-        recordFailure(tokenType);
+        recordFailure(tokenType === 'token2022' ? 'token2022' : 'detect');
         if (attempt < CONFIG.maxRetriesPerWallet - 1) {
-          attemptConn = switchToHealthiest(tokenType);
+          attemptConn = switchToHealthiest(tokenType === 'token2022' ? 'token2022' : 'detect');
           const waitTime = 500 + (attempt * 1000);
           console.log(`${c.dim} ⟳ Retry ${attempt + 1}/${CONFIG.maxRetriesPerWallet} - ${tokenType.toUpperCase()}${c.reset}`);
           await delay(waitTime);
@@ -175,7 +176,7 @@ async function fetchTokenAccountsWithRetry(walletPubKey, programId, tokenType) {
 }
 
 // ============================================
-// 🆕🆕🆕 AUTO-DETECT TOKEN TYPE SYSTEM
+// 🆕🆕🆕 AUTO-DETECT WITH getMultipleAccountsInfo
 // ============================================
 
 class MintTypeCache {
@@ -210,86 +211,124 @@ class MintTypeCache {
 const mintCache = new MintTypeCache();
 
 /**
- * 🆕 Auto-detect ว่า mint เป็น SPL หรือ Token-2022
- * วิธี: ดึง account info แล้วเช็ค owner program ID
+ * 🆕 ใช้ getMultipleAccountsInfo แทน getAccountInfo หลายครั้ง
+ * ลดจำนวน RPC calls จาก 599 -> ~6 calls (599/100)
  */
-async function detectMintType(mint, conn) {
-  // เช็ค cache ก่อน
-  const cached = mintCache.get(mint);
-  if (cached) return cached;
-
-  try {
-    const mintPubKey = new PublicKey(mint);
-    const accountInfo = await Promise.race([
-      conn.getAccountInfo(mintPubKey),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000))
-    ]);
-
-    if (!accountInfo) {
-      console.log(`${c.yellow}  ⚠ Mint not found: ${mint.substring(0, 20)}...${c.reset}`);
-      return 'spl'; // default to spl
-    }
-
-    const owner = accountInfo.owner.toBase58();
-
-    if (owner === TOKEN_2022_PROGRAM_ID.toBase58()) {
-      mintCache.set(mint, 'token2022');
-      return 'token2022';
-    } else if (owner === TOKEN_PROGRAM_ID.toBase58()) {
-      mintCache.set(mint, 'spl');
-      return 'spl';
-    } else {
-      console.log(`${c.yellow}  ⚠ Unknown owner ${owner.substring(0, 20)}... for mint ${mint.substring(0, 20)}...${c.reset}`);
-      mintCache.set(mint, 'spl');
-      return 'spl';
-    }
-
-  } catch (err) {
-    console.log(`${c.yellow}  ⚠ Detect failed for ${mint.substring(0, 20)}...: ${err.message.substring(0, 40)}${c.reset}`);
-    return 'spl'; // fallback
-  }
-}
-
-/**
- * 🆕 Batch detect หลาย mint พร้อมกัน (เร็วกว่า)
- */
-async function batchDetectMintTypes(mints, conn) {
+async function batchDetectMintTypes(mints) {
   const results = new Map();
   const toDetect = [];
 
-  // แยกที่มี cache กับไม่มี
+  // แยกที่มี cache
   for (const mint of mints) {
     const cached = mintCache.get(mint);
-    if (cached) {
-      results.set(mint, cached);
-    } else {
-      toDetect.push(mint);
-    }
+    if (cached) results.set(mint, cached);
+    else toDetect.push(mint);
   }
 
-  if (toDetect.length === 0) return results;
+  if (toDetect.length === 0) {
+    console.log(`${c.dim}  ✓ All ${mints.length} mints cached${c.reset}`);
+    return results;
+  }
 
-  console.log(`${c.cyan}  🔍 Auto-detecting ${toDetect.length} mint(s)...${c.reset}`);
+  console.log(`${c.cyan}  🔍 Auto-detecting ${toDetect.length} mint(s) using getMultipleAccountsInfo...${c.reset}`);
 
-  // ดึงพร้อมกัน (parallel with limit)
-  const batchSize = 10;
-  for (let i = 0; i < toDetect.length; i += batchSize) {
-    const batch = toDetect.slice(i, i + batchSize);
-    const promises = batch.map(async (mint) => {
-      const type = await detectMintType(mint, conn);
-      return { mint, type };
-    });
+  let conn = new Connection(DETECT_RPC_ENDPOINTS[currentDetectIndex], 'confirmed');
+  let detected = 0;
+  let failed = 0;
 
-    const batchResults = await Promise.all(promises);
-    for (const { mint, type } of batchResults) {
-      results.set(mint, type);
+  // แบ่งเป็น batch ละ 100 mints (limit ของ getMultipleAccountsInfo)
+  for (let i = 0; i < toDetect.length; i += CONFIG.multiAccountBatchSize) {
+    const batch = toDetect.slice(i, i + CONFIG.multiAccountBatchSize);
+    const pubKeys = batch.map(m => new PublicKey(m));
+
+    let success = false;
+    let retries = 0;
+
+    while (!success && retries < CONFIG.detectMaxRetries) {
+      try {
+        await delay(CONFIG.detectDelayMs);
+
+        const accounts = await Promise.race([
+          conn.getMultipleAccountsInfo(pubKeys),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), CONFIG.detectTimeoutMs))
+        ]);
+
+        // ประมวลผลผลลัพธ์
+        for (let j = 0; j < batch.length; j++) {
+          const mint = batch[j];
+          const account = accounts[j];
+
+          if (!account) {
+            // Account ไม่มี -> อาจเป็น invalid mint หรือ closed
+            mintCache.set(mint, 'spl');
+            results.set(mint, 'spl');
+            continue;
+          }
+
+          const owner = account.owner.toBase58();
+
+          if (owner === TOKEN_2022_PROGRAM_ID.toBase58()) {
+            mintCache.set(mint, 'token2022');
+            results.set(mint, 'token2022');
+            detected++;
+          } else if (owner === TOKEN_PROGRAM_ID.toBase58()) {
+            mintCache.set(mint, 'spl');
+            results.set(mint, 'spl');
+            detected++;
+          } else {
+            // Unknown owner -> fallback SPL
+            mintCache.set(mint, 'spl');
+            results.set(mint, 'spl');
+          }
+        }
+
+        success = true;
+
+      } catch (e) {
+        retries++;
+        const isRateLimit = e.message && e.message.includes('429');
+        const isTimeout = e.message && e.message.includes('timeout');
+
+        if (isRateLimit || isTimeout) {
+          recordFailure('detect');
+          if (retries < CONFIG.detectMaxRetries) {
+            conn = switchToHealthiest('detect');
+            const waitTime = isRateLimit ? 1000 * Math.pow(2, retries) : 500;
+            console.log(`${c.yellow}  ⚠ ${isRateLimit ? '429' : 'Timeout'} on batch ${Math.floor(i / CONFIG.multiAccountBatchSize) + 1}, switch RPC & wait ${waitTime}ms...${c.reset}`);
+            await delay(waitTime);
+          }
+        } else {
+          // Other error -> mark all in batch as failed
+          console.log(`${c.red}  ✗ Batch error: ${e.message.substring(0, 60)}${c.reset}`);
+          for (const mint of batch) {
+            mintCache.set(mint, 'spl');
+            results.set(mint, 'spl');
+            failed++;
+          }
+          success = true; // ข้ามไป batch ถัดไป
+        }
+      }
     }
 
-    if (i + batchSize < toDetect.length) await delay(200);
+    if (!success) {
+      // Max retries exceeded -> fallback all
+      for (const mint of batch) {
+        mintCache.set(mint, 'spl');
+        results.set(mint, 'spl');
+        failed++;
+      }
+    }
+
+    // Progress indicator
+    const progress = Math.min(i + CONFIG.multiAccountBatchSize, toDetect.length);
+    if (progress % 100 === 0 || progress === toDetect.length) {
+      process.stdout.write(`${c.dim}  ${progress}/${toDetect.length} processed...${c.reset}\r`);
+    }
   }
 
   const stats = mintCache.getStats();
-  console.log(`${c.green}  ✓ Detected: ${stats.spl} SPL, ${stats.token2022} Token-2022${c.reset}`);
+  console.log(`\n${c.green}  ✓ Detected: ${stats.spl} SPL, ${stats.token2022} Token-2022${c.reset}`);
+  if (failed > 0) console.log(`${c.yellow}  ⚠ Failed (fallback SPL): ${failed}${c.reset}`);
 
   return results;
 }
@@ -302,23 +341,15 @@ class TokenClassifier {
   constructor() {
     this.splTokens = new Map();
     this.token2022Tokens = new Map();
-    this.unknownTokens = new Map(); // รอ detect
+    this.unknownTokens = new Map();
   }
 
   addToken(mint, symbol, type = null) {
-    if (type === 'token2022') {
-      this.token2022Tokens.set(mint, symbol);
-    } else if (type === 'spl') {
-      this.splTokens.set(mint, symbol);
-    } else {
-      // ยังไม่รู้ type -> ใส่ unknown รอ auto-detect
-      this.unknownTokens.set(mint, symbol);
-    }
+    if (type === 'token2022') this.token2022Tokens.set(mint, symbol);
+    else if (type === 'spl') this.splTokens.set(mint, symbol);
+    else this.unknownTokens.set(mint, symbol);
   }
 
-  /**
-   * 🆕 รับผลจาก auto-detect แล้วจัดกลุ่ม
-   */
   async classifyFromDetections(detections) {
     for (const [mint, type] of detections) {
       const symbol = this.unknownTokens.get(mint) ||
@@ -387,7 +418,7 @@ async function main() {
   const startTime = Date.now();
 
   console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (Auto-Detect Token-2022)         ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (Auto-Detect v2 - Optimized)     ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}\n`);
 
   if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
@@ -395,7 +426,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Google Sheets Setup
+  // Google Sheets
   console.log(`${c.cyan}[1/7] Connecting to Google Sheets...${c.reset}`);
   const serviceAccountAuth = new JWT({
     email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -413,7 +444,7 @@ async function main() {
   }
 
   // Load custom RPC
-  let customSPL = null;
+  let customDetect = null;
   let customToken2022 = null;
   const nodesSheet = doc.sheetsByTitle['nodes'];
   if (nodesSheet) {
@@ -428,26 +459,26 @@ async function main() {
           if (netCell?.value?.toString().toLowerCase() === 'solana' && urlCell?.value) {
             const type = typeCell?.value?.toString().toLowerCase().trim();
             if (type === 'token2022') customToken2022 = String(urlCell.value).trim();
-            else if (type === 'spl' || !type) customSPL = String(urlCell.value).trim();
+            else customDetect = String(urlCell.value).trim();
           }
         }
       }
     } catch {}
   }
 
-  if (customSPL) SPL_RPC_ENDPOINTS.unshift(customSPL);
+  if (customDetect) DETECT_RPC_ENDPOINTS.unshift(customDetect);
   if (customToken2022) TOKEN2022_RPC_ENDPOINTS.unshift(customToken2022);
 
   // Check health
   console.log(`${c.cyan}[2/7] Checking RPC health...${c.reset}`);
-  const splConn = new Connection(SPL_RPC_ENDPOINTS[0], 'confirmed');
+  const detectConn = new Connection(DETECT_RPC_ENDPOINTS[0], 'confirmed');
   const t2022Conn = new Connection(TOKEN2022_RPC_ENDPOINTS[0], 'confirmed');
-  const [splHealthy, t2022Healthy] = await Promise.all([
-    checkRPCHealth(splConn),
+  const [detectHealthy, t2022Healthy] = await Promise.all([
+    checkRPCHealth(detectConn),
     checkRPCHealth(t2022Conn)
   ]);
-  console.log(`${splHealthy ? c.green : c.red}  SPL: ${splHealthy ? '✓ Healthy' : '✗ Unhealthy'}${c.reset}`);
-  console.log(`${t2022Healthy ? c.green : c.red}  Token-2022: ${t2022Healthy ? '✓ Healthy' : '✗ Unhealthy'}${c.reset}`);
+  console.log(`${detectHealthy ? c.green : c.red}  Detect RPC: ${detectHealthy ? '✓ Healthy' : '✗ Unhealthy'}${c.reset}`);
+  console.log(`${t2022Healthy ? c.green : c.red}  Token-2022 RPC: ${t2022Healthy ? '✓ Healthy' : '✗ Unhealthy'}${c.reset}`);
 
   // Load Wallets
   console.log(`${c.cyan}[3/7] Loading wallets...${c.reset}`);
@@ -477,9 +508,7 @@ async function main() {
   }
   console.log(`${c.green}✓ Loaded ${WALLETS.length} wallets${c.reset}`);
 
-  // ============================================
-  // 🆕 Load Tokens (ไม่ต้องระบุ Type ใน Sheet)
-  // ============================================
+  // Load Tokens
   console.log(`${c.cyan}[4/7] Loading token subscriptions...${c.reset}`);
   const classifier = new TokenClassifier();
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
@@ -488,7 +517,6 @@ async function main() {
     try {
       const maxRows = subsSheet.rowCount;
       if (maxRows >= 2) {
-        // 🆕 ใช้แค่ A และ C (Symbol, Mint) ไม่ต้องใช้ B (Type) แล้ว
         await subsSheet.loadCells(`A1:C${maxRows}`);
         for (let r = 1; r < maxRows; r++) {
           const symCell = subsSheet.getCell(r, 0);
@@ -505,11 +533,7 @@ async function main() {
           }
 
           for (const m of mints) {
-            try {
-              new PublicKey(m);
-              // 🆕 ไม่ระบุ type -> ใส่ unknown รอ auto-detect
-              classifier.addToken(m, sym, null);
-            } catch {}
+            try { new PublicKey(m); classifier.addToken(m, sym, null); } catch {}
           }
         }
       }
@@ -525,16 +549,11 @@ async function main() {
   console.log(`${c.green}✓ Loaded ${classifier.allMints.size} tokens (pending auto-detect)${c.reset}`);
 
   // ============================================
-  // 🆕🆕🆕 STEP 5: AUTO-DETECT TOKEN TYPES
+  // 🆕 STEP 5: AUTO-DETECT (Optimized)
   // ============================================
-  console.log(`${c.cyan}[5/7] Auto-detecting token types from on-chain data...${c.reset}`);
-
-  // ใช้ SPL connection หลักสำหรับ detect (เพราะแค่ดึง account info)
-  const detectConn = new Connection(SPL_RPC_ENDPOINTS[0], 'confirmed');
+  console.log(`${c.cyan}[5/7] Auto-detecting token types (getMultipleAccountsInfo)...${c.reset}`);
   const allMints = Array.from(classifier.allMints);
-  const detections = await batchDetectMintTypes(allMints, detectConn);
-
-  // จัดกลุ่มตามผล detect
+  const detections = await batchDetectMintTypes(allMints);
   await classifier.classifyFromDetections(detections);
 
   console.log(`${c.green}✓ Classification complete:${c.reset}`);
@@ -552,10 +571,8 @@ async function main() {
   }
   console.log(`${c.green}✓ Sheet ready${c.reset}`);
 
-  // ============================================
   // Process Wallets
-  // ============================================
-  console.log(`\n${c.cyan}${c.bright}>> Scanning wallets (Auto-Detect Mode)${c.reset}`);
+  console.log(`\n${c.cyan}${c.bright}>> Scanning wallets${c.reset}`);
   console.log(`${c.dim}SPL: ${classifier.splCount} | Token-2022: ${classifier.token2022Count}${c.reset}\n`);
 
   let totalAdded = 0;
@@ -571,29 +588,21 @@ async function main() {
     process.stdout.write(`${walletInfo} ${wallet.name.padEnd(35, ' ')} `);
 
     let walletAdded = 0;
-    let walletSuccess = false;
 
     try {
       const walletPubKey = new PublicKey(wallet.address);
       const results = [];
 
-      // Fetch SPL tokens
       if (classifier.splCount > 0) {
-        const splResult = await fetchTokenAccountsWithRetry(
-          walletPubKey, TOKEN_PROGRAM_ID, 'spl'
-        );
+        const splResult = await fetchTokenAccountsWithRetry(walletPubKey, TOKEN_PROGRAM_ID, 'spl');
         results.push(splResult);
       }
 
-      // Fetch Token-2022
       if (classifier.token2022Count > 0) {
-        const t2022Result = await fetchTokenAccountsWithRetry(
-          walletPubKey, TOKEN_2022_PROGRAM_ID, 'token2022'
-        );
+        const t2022Result = await fetchTokenAccountsWithRetry(walletPubKey, TOKEN_2022_PROGRAM_ID, 'token2022');
         results.push(t2022Result);
       }
 
-      // รวมผลลัพธ์
       const allAccounts = [];
       for (const res of results) {
         if (res.success) {
@@ -605,7 +614,6 @@ async function main() {
 
       totalProcessed += allAccounts.length;
 
-      // Process tokens
       for (const item of allAccounts) {
         try {
           const parsedInfo = item.account.data.parsed.info;
@@ -629,7 +637,6 @@ async function main() {
 
             walletAdded++;
             totalAdded++;
-            walletSuccess = true;
           }
         } catch (tokenErr) {}
       }
@@ -649,14 +656,14 @@ async function main() {
     }
 
     if (walletNum % CONFIG.rpcHealthCheckInterval === 0) {
-      resetFailures('spl');
+      resetFailures('detect');
       resetFailures('token2022');
     }
 
     if (walletNum < WALLETS.length) await delay(CONFIG.delayBetweenWallets);
   }
 
-  // Write to Google Sheets
+  // Write
   console.log(`\n${c.cyan}>> Writing ${rowsToAdd.length} record(s) to Google Sheets...${c.reset}`);
 
   if (rowsToAdd.length > 0) {
@@ -683,7 +690,7 @@ async function main() {
   console.log(`Execution Time: ${execMins} minutes`);
   console.log(`Wallets Processed: ${WALLETS.length}`);
   console.log(`Empty Wallets: ${totalEmptyWallets}`);
-  console.log(`Cache Stats: ${cacheStats.spl} SPL, ${cacheStats.token2022} Token-2022 (total: ${cacheStats.total})`);
+  console.log(`Cache: ${cacheStats.spl} SPL, ${cacheStats.token2022} Token-2022`);
   console.log(`Total Accounts Found: ${totalProcessed}`);
   console.log(`${c.green}Total Records Added: ${totalAdded}${c.reset}`);
 
