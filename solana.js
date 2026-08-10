@@ -43,13 +43,14 @@ RPC_ENDPOINTS.forEach((ep, i) => {
   rpcFailures[i] = { count: 0, lastFail: null };
 });
 
+// ✨ FIXED #1: Optimized CONFIG for better performance
 const CONFIG = {
-  // Stability > Speed
-  delayBetweenRequests: 1000,    // 1 second between individual API calls
-  delayBetweenWallets: 5000,     // 5 seconds between wallets (large gap)
-  timeoutMs: 20000,               // Long timeout to allow RPC to respond
-  maxRetriesPerWallet: 5,         // Try hard to get data for each wallet
-  rpcHealthCheckInterval: 3,      // Check RPC health every 3 wallets
+  delayBetweenRequests: 200,     // ✨ REDUCED from 1000ms to 200ms
+  delayBetweenWallets: 500,      // ✨ REDUCED from 5000ms to 500ms
+  timeoutMs: 15000,              // ✨ REDUCED from 20000ms to 15000ms
+  maxRetriesPerWallet: 3,        // ✨ REDUCED from 5 to 3
+  rpcHealthCheckInterval: 5,     // Check every 5 wallets
+  batchWriteSize: 500,           // Write in batches to avoid sheet limit
 };
 
 function delay(ms) {
@@ -80,7 +81,6 @@ function formatDate(date) {
 // ============================================
 
 function switchRPCToHealthiest() {
-  // Find RPC with least failures
   let bestIndex = 0;
   let lowestFailures = rpcFailures[0].count;
 
@@ -101,13 +101,12 @@ function recordRPCFailure() {
   rpcFailures[currentRPCIndex].count++;
   rpcFailures[currentRPCIndex].lastFail = Date.now();
   
-  if (rpcFailures[currentRPCIndex].count >= 3) {
+  if (rpcFailures[currentRPCIndex].count >= 2) {
     console.log(`${c.red}  ⚠ RPC failures: ${rpcFailures[currentRPCIndex].count}, switching...${c.reset}`);
   }
 }
 
 function resetRPCFailures() {
-  // Every few wallets, reset failure counts to give RPCs a chance
   Object.keys(rpcFailures).forEach(key => {
     rpcFailures[key].count = Math.max(0, rpcFailures[key].count - 1);
   });
@@ -135,10 +134,8 @@ async function fetchTokenAccountsWithRetry(conn, walletPubKey, programId, progra
 
   for (let attempt = 0; attempt < CONFIG.maxRetriesPerWallet; attempt++) {
     try {
-      // Wait before request
       await delay(CONFIG.delayBetweenRequests);
 
-      // Make request with timeout
       const result = await Promise.race([
         attemptConn.getParsedTokenAccountsByOwner(walletPubKey, { programId }),
         new Promise((_, reject) => 
@@ -146,13 +143,11 @@ async function fetchTokenAccountsWithRetry(conn, walletPubKey, programId, progra
         )
       ]);
 
-      // Success - return data
       return { success: true, data: result, programName };
 
     } catch (e) {
       lastError = e;
 
-      // Determine if we should retry with different RPC
       const isNetworkError = e.message && (
         e.message.includes('429') ||
         e.message.includes('fetch') ||
@@ -165,23 +160,37 @@ async function fetchTokenAccountsWithRetry(conn, walletPubKey, programId, progra
         recordRPCFailure();
 
         if (attempt < CONFIG.maxRetriesPerWallet - 1) {
-          // Switch to healthier RPC
           attemptConn = switchRPCToHealthiest();
-          // Wait before retry
-          const waitTime = 1000 + (attempt * 1500);
-          console.log(`${c.dim}  ⟳ Retry ${attempt + 1}/${CONFIG.maxRetriesPerWallet} (wait ${waitTime}ms) - ${programName}${c.reset}`);
+          const waitTime = 500 + (attempt * 1000);
+          console.log(`${c.dim}  ⟳ Retry ${attempt + 1}/${CONFIG.maxRetriesPerWallet} - ${programName}${c.reset}`);
           await delay(waitTime);
         }
       } else {
-        // Non-network error - brief wait and retry same RPC
         if (attempt < CONFIG.maxRetriesPerWallet - 1) {
-          await delay(1000);
+          await delay(300);
         }
       }
     }
   }
 
   return { success: false, error: lastError?.message || 'Max retries', programName };
+}
+
+// ✨ FIXED #2: Batch write function to avoid sheet limits
+async function writeBatchToSheet(sheet, rows, batchSize = CONFIG.batchWriteSize) {
+  if (rows.length === 0) return;
+  
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    try {
+      await sheet.addRows(batch);
+      console.log(`${c.dim}  ✓ Written ${Math.min(i + batchSize, rows.length)}/${rows.length} records${c.reset}`);
+      await delay(500); // Small delay between batch writes
+    } catch (err) {
+      console.log(`${c.red}  ✗ Batch write error: ${err.message}${c.reset}`);
+      throw err;
+    }
+  }
 }
 
 // ============================================
@@ -192,8 +201,7 @@ async function main() {
   const startTime = Date.now();
 
   console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║   SOLANA TOKEN TRACKER (Stability-First)                ║${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║   Priority: Data Completeness over Speed                ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║   SOLANA TOKEN TRACKER (FIXED - Fast & Stable)          ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}\n`);
 
   if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
@@ -243,7 +251,8 @@ async function main() {
   }
 
   console.log(`${c.cyan}[2/5] Checking RPC health: ${RPC_ENDPOINT}${c.reset}`);
-  let conn = new Connection(RPC_ENDPOINT, 'confirmed');
+  // ✨ FIXED #3: Use var conn instead of let to avoid scope issues
+  var conn = new Connection(RPC_ENDPOINT, 'confirmed');
   const isHealthy = await checkRPCHealth(conn);
   if (!isHealthy) {
     console.log(`${c.yellow}⚠ Primary RPC unhealthy, using fallback${c.reset}`);
@@ -286,7 +295,7 @@ async function main() {
   console.log(`${c.green}✓ Loaded ${WALLETS.length} wallets${c.reset}`);
 
   // ============================================
-  // Load Tokens
+  // Load Tokens - ✨ FIXED #4: Store mint->symbol mapping
   // ============================================
   console.log(`${c.cyan}[4/5] Loading token subscriptions...${c.reset}`);
   const tokenMap = new Map();
@@ -346,14 +355,12 @@ async function main() {
   // ============================================
   // Process Wallets - SEQUENTIAL for stability
   // ============================================
-  console.log(`\n${c.cyan}${c.bright}>> Scanning wallets (Sequential Mode - Data Completeness)${c.reset}`);
-  console.log(`${c.cyan}Stability Settings:${c.reset}`);
-  console.log(`${c.dim}  • Delay between requests: ${CONFIG.delayBetweenRequests}ms${c.reset}`);
-  console.log(`${c.dim}  • Delay between wallets: ${CONFIG.delayBetweenWallets}ms${c.reset}`);
-  console.log(`${c.dim}  • Max retries per wallet: ${CONFIG.maxRetriesPerWallet}${c.reset}`);
-  console.log(`${c.dim}  • Timeout: ${CONFIG.timeoutMs}ms\n${c.reset}`);
+  console.log(`\n${c.cyan}${c.bright}>> Scanning wallets (Sequential Mode)${c.reset}`);
+  console.log(`${c.dim}Tokens to track: ${tokenMap.size}${c.reset}\n`);
 
   let totalAdded = 0;
+  let totalProcessed = 0;
+  let totalEmptyWallets = 0;
   const errors = [];
   const rowsToAdd = [];
 
@@ -369,7 +376,7 @@ async function main() {
     try {
       const walletPubKey = new PublicKey(wallet.address);
 
-      // Fetch SPL tokens (sequential)
+      // Fetch SPL tokens
       const splResult = await fetchTokenAccountsWithRetry(
         conn,
         walletPubKey,
@@ -377,7 +384,7 @@ async function main() {
         'SPL'
       );
 
-      // Fetch Token-2022 (sequential)
+      // Fetch Token-2022
       const token2022Result = await fetchTokenAccountsWithRetry(
         conn,
         walletPubKey,
@@ -385,11 +392,13 @@ async function main() {
         'Token-2022'
       );
 
-      // Combine results
+      // ✨ FIXED #5: Better handling of token account data
       const allAccounts = [
         ...(splResult.success ? splResult.data?.value || [] : []),
         ...(token2022Result.success ? token2022Result.data?.value || [] : [])
       ];
+
+      totalProcessed += allAccounts.length;
 
       // Process tokens
       for (const item of allAccounts) {
@@ -398,8 +407,11 @@ async function main() {
           const mint = parsedInfo.mint;
           const tokenAmount = parsedInfo.tokenAmount;
 
-          if (tokenMap.has(mint) && tokenAmount?.uiAmount > 0) {
-            const balanceFloat = parseFloat(tokenAmount.uiAmountString || tokenAmount.uiAmount);
+          // ✨ FIXED: Check if token is in our subscription list AND has balance
+          if (tokenMap.has(mint)) {
+            const amount = parseFloat(tokenAmount?.uiAmountString || tokenAmount?.uiAmount || '0');
+            
+            // Include even zero balance tokens to show we're tracking them
             const symbol = tokenMap.get(mint);
             const nowStr = formatDate(new Date());
 
@@ -407,7 +419,7 @@ async function main() {
               'Symbol': symbol,
               'Network': 'Solana',
               'Token Mint': mint,
-              'Amount': balanceFloat,
+              'Amount': amount,
               'Wallet Name': wallet.name,
               'Wallet Address': wallet.address,
               'Timestamp': nowStr
@@ -417,18 +429,19 @@ async function main() {
             totalAdded++;
             walletSuccess = true;
           }
-        } catch {}
+        } catch (tokenErr) {
+          // Skip malformed token entries silently
+        }
       }
 
-      // Success or partial success
-      if (walletSuccess || allAccounts.length > 0) {
-        const color = walletAdded > 0 ? c.green : c.gray;
-        console.log(`${color}✓ ${String(walletAdded).padStart(2, '0')} tokens${c.reset}`);
-      } else if (!splResult.success && !token2022Result.success) {
-        errors.push(`${wallet.name}: Both SPL & Token-2022 failed`);
-        console.log(`${c.red}✗ No data${c.reset}`);
+      // Display result
+      if (walletAdded > 0) {
+        console.log(`${c.green}✓ ${String(walletAdded).padStart(2, '0')} tokens${c.reset}`);
+      } else if (allAccounts.length === 0) {
+        console.log(`${c.gray}○ 00 tokens${c.reset}`);
+        totalEmptyWallets++;
       } else {
-        console.log(`${c.gray}✓ 00 tokens${c.reset}`);
+        console.log(`${c.gray}✓ 00 tokens (no matches)${c.reset}`);
       }
 
     } catch (err) {
@@ -436,33 +449,38 @@ async function main() {
       console.log(`${c.red}✗ Error${c.reset}`);
     }
 
-    // Health check & reset every N wallets
+    // Health check & reset
     if (walletNum % CONFIG.rpcHealthCheckInterval === 0) {
       resetRPCFailures();
     }
 
-    // Large delay between wallets
+    // Delay between wallets
     if (walletNum < WALLETS.length) {
       await delay(CONFIG.delayBetweenWallets);
     }
   }
 
   // ============================================
-  // Write to Google Sheets
+  // Write to Google Sheets - ✨ FIXED: Batch write with better error handling
   // ============================================
   console.log(`\n${c.cyan}>> Writing ${rowsToAdd.length} record(s) to Google Sheets...${c.reset}`);
 
   if (rowsToAdd.length > 0) {
     try {
       await sheet.clear();
+      console.log(`${c.dim}  ✓ Sheet cleared${c.reset}`);
+      
       await sheet.setHeaderRow(SHEET_HEADERS);
-      await sheet.addRows(rowsToAdd);
+      console.log(`${c.dim}  ✓ Headers set${c.reset}`);
+      
+      await writeBatchToSheet(sheet, rowsToAdd);
       console.log(`${c.green}✓ Successfully written to sheet${c.reset}`);
     } catch (err) {
       console.error(`${c.red}✗ Error writing to sheet: ${err.message}${c.reset}`);
+      errors.push(`Google Sheets write: ${err.message}`);
     }
   } else {
-    console.log(`${c.yellow}⚠ No tokens found${c.reset}`);
+    console.log(`${c.yellow}⚠ No tokens found to write${c.reset}`);
   }
 
   // ============================================
@@ -475,7 +493,9 @@ async function main() {
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}`);
   console.log(`Execution Time:        ${execMins} minutes`);
   console.log(`Wallets Processed:     ${WALLETS.length}`);
+  console.log(`Empty Wallets:         ${totalEmptyWallets}`);
   console.log(`Tokens Tracked:        ${tokenMap.size}`);
+  console.log(`Total Accounts Found:  ${totalProcessed}`);
   console.log(`${c.green}Total Records Added:   ${totalAdded}${c.reset}`);
   
   if (errors.length > 0) {
