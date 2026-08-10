@@ -6,20 +6,11 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const c = {
-  reset: '\x1b[0m',
-  bright: '\x1b[1m',
-  dim: '\x1b[2m',
-  cyan: '\x1b[36m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  red: '\x1b[31m',
-  gray: '\x1b[90m',
-  magenta: '\x1b[35m'
+  reset: '\x1b[0m', bright: '\x1b[1m', dim: '\x1b[2m',
+  cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m',
+  red: '\x1b[31m', gray: '\x1b[90m', magenta: '\x1b[35m'
 };
 
-// ============================================
-// 1. CONFIGURATION
-// ============================================
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
@@ -30,41 +21,32 @@ const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================
-// 2. RPC ENDPOINTS (แยกตาม Token Type)
+// 🆕 RPC ENDPOINTS - แยกสนิท ไม่มีส่วนไหนทับซ้อน
 // ============================================
 
-// 🔹 SPL Tokens - ใช้ได้ทุก node (จากโค้ดเดิม)
+// 🔹 SPL ONLY - ใช้ได้ทุก node
 const SPL_RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
-  'https://solana-api.projectserum.com',
-  'https://api.triton.one/networks/solana/solana-mainnet',
 ];
 
-// 🔹 Token-2022 - ต้องใช้ node ที่รองรับดี
+// 🔹 Token-2022 ONLY - ต้องรองรับ parsed accounts
 const TOKEN2022_RPC_ENDPOINTS = [
-  'https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY',
-  'https://solana-mainnet.rpc.extrnode.com',
-  'https://api.triton.one/networks/solana/solana-mainnet',
-  'https://api.mainnet-beta.solana.com',
+  'https://solana.drpc.org',                    // ฟรี รองรับดี
+  'https://solana-rpc.publicnode.com',          // fallback
+  'https://api.mainnet-beta.solana.com',        // fallback สุดท้าย
 ];
 
-let currentSPLIndex = 0;
-let currentToken2022Index = 0;
+// 🆕 เก็บ connection แยกกันไม่ให้ปนกัน
+let splConn = null;
+let token2022Conn = null;
+
 const RPC_CONFIG = {
   maxRetries: 3,
-  retryDelayMs: 800,
-  timeoutMs: 12000,
-  healthCheckTimeoutMs: 5000,
-  // 🆕 Token-2022 specific
-  token2022DelayMs: 2000,
+  retryDelayMs: 1000,
+  timeoutMs: 15000,
   token2022TimeoutMs: 30000,
-  token2022MaxRetries: 5,
 };
-
-// ============================================
-// 3. UTILITY FUNCTIONS
-// ============================================
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -82,144 +64,145 @@ function formatDate(date) {
   return `${partMap.month}/${partMap.day}/${partMap.year} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
 }
 
-function switchSPLRPC() {
-  currentSPLIndex = (currentSPLIndex + 1) % SPL_RPC_ENDPOINTS.length;
-  const endpoint = SPL_RPC_ENDPOINTS[currentSPLIndex];
-  console.log(`${c.yellow}⚠ [SPL] Switching to: ${endpoint.split('/')[2]}${c.reset}`);
-  return new Connection(endpoint, 'confirmed');
-}
-
-function switchToken2022RPC() {
-  currentToken2022Index = (currentToken2022Index + 1) % TOKEN2022_RPC_ENDPOINTS.length;
-  const endpoint = TOKEN2022_RPC_ENDPOINTS[currentToken2022Index];
-  console.log(`${c.yellow}⚠ [Token-2022] Switching to: ${endpoint.split('/')[2]}${c.reset}`);
-  return new Connection(endpoint, 'confirmed');
-}
-
 // ============================================
-// 4. RPC HEALTH CHECK
+// 🆕 INIT CONNECTIONS แยกกันตั้งแต่ต้น
 // ============================================
 
-async function checkRPCHealth(endpoint) {
-  try {
-    const conn = new Connection(endpoint, 'confirmed');
-    const slot = await Promise.race([
-      conn.getSlot(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), RPC_CONFIG.healthCheckTimeoutMs))
-    ]);
-    return { healthy: true, slot };
-  } catch (err) {
-    return { healthy: false, error: err.message };
+async function initConnections() {
+  // SPL connection - ใช้ตัวแรกที่ healthy
+  for (const endpoint of SPL_RPC_ENDPOINTS) {
+    try {
+      const conn = new Connection(endpoint, 'confirmed');
+      await Promise.race([
+        conn.getSlot(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+      ]);
+      splConn = conn;
+      console.log(`${c.green}✓ [SPL] Connected: ${endpoint.split('/')[2]}${c.reset}`);
+      break;
+    } catch {
+      console.log(`${c.yellow}⚠ [SPL] Skip: ${endpoint.split('/')[2]}${c.reset}`);
+    }
+  }
+
+  // Token-2022 connection - ใช้ตัวแรกที่ healthy  
+  for (const endpoint of TOKEN2022_RPC_ENDPOINTS) {
+    try {
+      const conn = new Connection(endpoint, 'confirmed');
+      await Promise.race([
+        conn.getSlot(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+      ]);
+      token2022Conn = conn;
+      console.log(`${c.green}✓ [Token-2022] Connected: ${endpoint.split('/')[2]}${c.reset}`);
+      break;
+    } catch {
+      console.log(`${c.yellow}⚠ [Token-2022] Skip: ${endpoint.split('/')[2]}${c.reset}`);
+    }
+  }
+
+  if (!splConn) {
+    console.error(`${c.red}✗ No SPL RPC available${c.reset}`);
+    process.exit(1);
+  }
+  
+  if (!token2022Conn) {
+    console.log(`${c.yellow}⚠ No Token-2022 RPC available, will skip Token-2022 fetch${c.reset}`);
   }
 }
 
 // ============================================
-// 5. SPL FETCH (เร็วตามปกติ)
+// 🆕 FETCH SPL - ใช้ splConn เท่านั้น ไม่สลับไปไหน
 // ============================================
 
 async function fetchSPLAccounts(walletPubKey) {
-  let conn = new Connection(SPL_RPC_ENDPOINTS[currentSPLIndex], 'confirmed');
-  let lastError;
+  if (!splConn) return { success: false, error: 'No SPL connection', data: [] };
 
   for (let attempt = 0; attempt < RPC_CONFIG.maxRetries; attempt++) {
     try {
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('RPC timeout')), RPC_CONFIG.timeoutMs)
-      );
-
+      await delay(200); // ห่างหน่อย
+      
       const result = await Promise.race([
-        conn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_PROGRAM_ID }),
-        timeoutPromise
+        splConn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_PROGRAM_ID }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), RPC_CONFIG.timeoutMs))
       ]);
 
       return { success: true, data: result.value };
 
     } catch (e) {
-      lastError = e;
-      const isNetworkError = e.message && (
-        e.message.includes('fetch') || e.message.includes('429') ||
-        e.message.includes('403') || e.message.includes('timeout') ||
-        e.message.includes('ECONNREFUSED') || e.message.includes('ETIMEDOUT')
-      );
-
-      if (attempt < RPC_CONFIG.maxRetries - 1 && isNetworkError) {
-        conn = switchSPLRPC();
-        await delay(RPC_CONFIG.retryDelayMs + (attempt * 500));
+      const is429 = e.message?.includes('429');
+      const isTimeout = e.message?.includes('timeout');
+      
+      if ((is429 || isTimeout) && attempt < RPC_CONFIG.maxRetries - 1) {
+        console.log(`${c.dim}    [SPL] Retry ${attempt + 1}, wait ${RPC_CONFIG.retryDelayMs}ms${c.reset}`);
+        await delay(RPC_CONFIG.retryDelayMs);
+      } else {
+        return { success: false, error: e.message, data: [] };
       }
     }
   }
-
-  return { success: false, error: lastError?.message, data: [] };
+  
+  return { success: false, error: 'Max retries', data: [] };
 }
 
 // ============================================
-// 6. TOKEN-2022 FETCH (ช้าแต่ชัวร์)
+// 🆕 FETCH TOKEN-2022 - ใช้ token2022Conn เท่านั้น
 // ============================================
 
 async function fetchToken2022Accounts(walletPubKey) {
-  console.log(`${c.dim}    [Token-2022] Starting fetch...${c.reset}`);
-  
-  // ลองทุก RPC ในลิสต์
-  for (let rpcIdx = 0; rpcIdx < TOKEN2022_RPC_ENDPOINTS.length; rpcIdx++) {
-    const endpoint = TOKEN2022_RPC_ENDPOINTS[rpcIdx];
-    const conn = new Connection(endpoint, 'confirmed');
-    
-    console.log(`${c.dim}    Trying ${endpoint.split('/')[2]}...${c.reset}`);
-    
-    for (let attempt = 0; attempt < RPC_CONFIG.token2022MaxRetries; attempt++) {
-      try {
-        await delay(RPC_CONFIG.token2022DelayMs + (attempt * 1000));
-        
-        const result = await Promise.race([
-          conn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_2022_PROGRAM_ID }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), RPC_CONFIG.token2022TimeoutMs))
-        ]);
-        
-        console.log(`${c.green}    ✓ Token-2022: ${result.value.length} accounts from ${endpoint.split('/')[2]}${c.reset}`);
-        return { success: true, data: result.value };
+  if (!token2022Conn) {
+    return { success: false, error: 'No Token-2022 connection', data: [] };
+  }
 
-      } catch (e) {
-        const isUnsupported = e.message && (
-          e.message.includes('not supported') || 
-          e.message.includes('Method not found') ||
-          e.message.includes('Invalid param') ||
-          e.message.includes('programId not supported')
-        );
-        
-        if (isUnsupported) {
-          console.log(`${c.yellow}    ⚠ ${endpoint.split('/')[2]} doesn't support Token-2022${c.reset}`);
-          break;
-        }
-        
-        const isRateLimit = e.message && (e.message.includes('429') || e.message.includes('Too Many'));
-        if (isRateLimit && attempt < RPC_CONFIG.token2022MaxRetries - 1) {
-          const waitTime = 3000 * Math.pow(2, attempt);
-          console.log(`${c.dim}    ⟳ 429 - wait ${waitTime}ms${c.reset}`);
-          await delay(waitTime);
-        } else {
-          console.log(`${c.dim}    ✗ ${e.message.substring(0, 50)}${c.reset}`);
-        }
+  for (let attempt = 0; attempt < RPC_CONFIG.maxRetries; attempt++) {
+    try {
+      await delay(2000); // 🆕 ห่างมากกว่า SPL
+      
+      const result = await Promise.race([
+        token2022Conn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_2022_PROGRAM_ID }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), RPC_CONFIG.token2022TimeoutMs))
+      ]);
+
+      return { success: true, data: result.value };
+
+    } catch (e) {
+      const isUnsupported = e.message?.includes('not supported') || 
+                           e.message?.includes('Method not found');
+      const is429 = e.message?.includes('429');
+      
+      if (isUnsupported) {
+        console.log(`${c.yellow}    [T2022] RPC doesn't support parsed accounts${c.reset}`);
+        return { success: false, error: 'Not supported', data: [] };
+      }
+      
+      if ((is429) && attempt < RPC_CONFIG.maxRetries - 1) {
+        const wait = 3000 * Math.pow(2, attempt);
+        console.log(`${c.dim}    [T2022] 429, wait ${wait}ms${c.reset}`);
+        await delay(wait);
+      } else if (attempt < RPC_CONFIG.maxRetries - 1) {
+        await delay(RPC_CONFIG.retryDelayMs);
+      } else {
+        return { success: false, error: e.message, data: [] };
       }
     }
   }
   
-  console.log(`${c.red}    ✗ All Token-2022 RPC exhausted${c.reset}`);
-  return { success: false, error: 'All RPC exhausted', data: [] };
+  return { success: false, error: 'Max retries', data: [] };
 }
 
 // ============================================
-// 7. MAIN FUNCTION
+// MAIN
 // ============================================
 
 async function main() {
   const startTime = Date.now();
 
   console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (SPL + Token-2022 Split)         ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (Isolated Connections)           ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}\n`);
 
   if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
-    console.error(`${c.red}✗ Missing environment variables${c.reset}`);
+    console.error(`${c.red}✗ Missing env vars${c.reset}`);
     process.exit(1);
   }
 
@@ -240,7 +223,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Load custom RPC from nodes sheet
+  // Load custom RPC
   const nodesSheet = doc.sheetsByTitle['nodes'];
   if (nodesSheet) {
     try {
@@ -256,26 +239,17 @@ async function main() {
             const url = String(urlCell.value).trim();
             const type = typeCell?.value ? String(typeCell.value).toLowerCase().trim() : 'spl';
             
-            if (type === 'token2022') {
-              TOKEN2022_RPC_ENDPOINTS.unshift(url);
-              console.log(`${c.dim}  + Custom Token-2022 RPC: ${url.split('/')[2]}${c.reset}`);
-            } else {
-              SPL_RPC_ENDPOINTS.unshift(url);
-              console.log(`${c.dim}  + Custom SPL RPC: ${url.split('/')[2]}${c.reset}`);
-            }
+            if (type === 'token2022') TOKEN2022_RPC_ENDPOINTS.unshift(url);
+            else SPL_RPC_ENDPOINTS.unshift(url);
           }
         }
       }
     } catch {}
   }
 
-  // Check health
-  console.log(`${c.cyan}[2/5] Checking RPC health...${c.reset}`);
-  const splHealth = await checkRPCHealth(SPL_RPC_ENDPOINTS[0]);
-  const t2022Health = await checkRPCHealth(TOKEN2022_RPC_ENDPOINTS[0]);
-  
-  console.log(`${splHealth.healthy ? c.green : c.red}  SPL: ${splHealth.healthy ? '✓ ' + SPL_RPC_ENDPOINTS[0].split('/')[2] : '✗ ' + splHealth.error}${c.reset}`);
-  console.log(`${t2022Health.healthy ? c.green : c.red}  Token-2022: ${t2022Health.healthy ? '✓ ' + TOKEN2022_RPC_ENDPOINTS[0].split('/')[2] : '✗ Unhealthy'}${c.reset}`);
+  // 🆕 Init connections แยกกัน
+  console.log(`${c.cyan}[2/5] Initializing RPC connections...${c.reset}`);
+  await initConnections();
 
   // Load Wallets
   console.log(`${c.cyan}[3/5] Loading wallets...${c.reset}`);
@@ -355,19 +329,19 @@ async function main() {
   console.log(`${c.green}✓ Sheet ready${c.reset}`);
 
   // ============================================
-  // 8. PROCESS WALLETS (แยก SPL / Token-2022)
+  // 🆕 PROCESS WALLETS - แยก fetch ชัดเจน
   // ============================================
   console.log(`\n${c.cyan}${c.bright}>> Scanning wallets${c.reset}`);
-  console.log(`${c.gray}SPL: ${SPL_RPC_ENDPOINTS[0].split('/')[2]} | Token-2022: ${TOKEN2022_RPC_ENDPOINTS[0].split('/')[2]}${c.reset}\n`);
+  console.log(`${c.gray}SPL: ${splConn ? splConn.rpcEndpoint.split('/')[2] : 'N/A'} | Token-2022: ${token2022Conn ? token2022Conn.rpcEndpoint.split('/')[2] : 'N/A'}${c.reset}\n`);
 
   let totalAdded = 0;
-  let totalToken2022Found = 0;
+  let totalT2022Found = 0;
   const errors = [];
   const rowsToAdd = [];
 
   for (let wIdx = 0; wIdx < WALLETS.length; wIdx++) {
     const wallet = WALLETS[wIdx];
-    const walletInfo = `${c.gray}[${String(wIdx + 1).padStart(3, '0')}/${String(WALLETS.length).padStart(3, '0')}]${c.reset}`;
+    const walletInfo = `${c.gray}[${String(wIdx + 1).padStart(3, '0')}/${WALLETS.length}]${c.reset}`;
     process.stdout.write(`${walletInfo} ${wallet.name.padEnd(35, ' ')} `);
 
     let walletAdded = 0;
@@ -376,25 +350,23 @@ async function main() {
     try {
       const walletPubKey = new PublicKey(wallet.address);
 
-      // 1️⃣ Fetch SPL (เร็ว)
+      // 1️⃣ Fetch SPL (ใช้ splConn อย่างเดียว)
       const splResult = await fetchSPLAccounts(walletPubKey);
-      let allAccounts = [];
+      let allAccounts = splResult.success ? splResult.data : [];
       
-      if (splResult.success) {
-        allAccounts = splResult.data;
-      } else {
+      if (!splResult.success) {
         errors.push(`${wallet.name} [SPL]: ${splResult.error}`);
       }
 
-      // 2️⃣ Fetch Token-2022 (ช้าแต่ละเอียด)
+      // 2️⃣ Fetch Token-2022 (ใช้ token2022Conn อย่างเดียว)
       const t2022Result = await fetchToken2022Accounts(walletPubKey);
       
       if (t2022Result.success) {
         allAccounts.push(...t2022Result.data);
         walletT2022 = t2022Result.data.length;
-        totalToken2022Found += walletT2022;
-      } else {
-        errors.push(`${wallet.name} [Token-2022]: ${t2022Result.error}`);
+        totalT2022Found += walletT2022;
+      } else if (t2022Result.error !== 'No Token-2022 connection') {
+        errors.push(`${wallet.name} [T2022]: ${t2022Result.error}`);
       }
 
       // Process
@@ -461,7 +433,7 @@ async function main() {
   console.log(`${c.cyan}${c.bright}║  EXECUTION SUMMARY                                     ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}`);
   console.log(`${c.gray}Time: ${execSecs}s | Wallets: ${WALLETS.length}${c.reset}`);
-  console.log(`${c.gray}Token-2022 Accounts Found: ${totalToken2022Found}${c.reset}`);
+  console.log(`${c.gray}Token-2022 Accounts: ${totalT2022Found}${c.reset}`);
   console.log(`${c.green}Records Added: ${totalAdded}${c.reset}`);
   
   if (errors.length > 0) {
