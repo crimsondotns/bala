@@ -21,13 +21,16 @@ const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
 const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 
 // ============================================
-// RPC ENDPOINTS
+// RPC ENDPOINTS - ฟรี ไม่มี API Key
 // ============================================
+
+// 🔹 SPL ONLY
 const SPL_RPC_ENDPOINTS = [
   'https://api.mainnet-beta.solana.com',
   'https://solana-rpc.publicnode.com',
 ];
 
+// 🔹 Token-2022 ONLY - ไม่มี Helius!
 const TOKEN2022_RPC_ENDPOINTS = [
   'https://solana-rpc.publicnode.com',
   'https://api.mainnet-beta.solana.com',
@@ -36,13 +39,13 @@ const TOKEN2022_RPC_ENDPOINTS = [
 let splConn = null;
 let token2022Conn = null;
 
-// 🆕 ลด timeout ลง ไม่รอนาน
+// 🆕 เพิ่ม Token-2022 timeout ให้นานขึ้น
 const CONFIG = {
   splTimeoutMs: 10000,           // SPL 10 วิ
-  token2022TimeoutMs: 15000,     // Token-2022 15 วิ (ลดจาก 30 วิ)
-  token2022DelayMs: 500,         // ห่าง 0.5 วิ (ลดจาก 2 วิ)
-  maxRetries: 2,                 // ลองแค่ 2 ครั้ง
-  walletDelayMs: 800,            // ห่างระหว่าง wallet 0.8 วิ
+  token2022TimeoutMs: 60000,     // 🆕 Token-2022 60 วิ (เพิ่มจาก 15 วิ)
+  token2022DelayMs: 500,
+  maxRetries: 3,
+  walletDelayMs: 800,
 };
 
 function delay(ms) {
@@ -103,7 +106,7 @@ async function initConnections() {
 }
 
 // ============================================
-// FETCH SPL - เร็ว
+// FETCH SPL
 // ============================================
 
 async function fetchSPLAccounts(walletPubKey) {
@@ -122,7 +125,7 @@ async function fetchSPLAccounts(walletPubKey) {
 }
 
 // ============================================
-// 🆕 FETCH TOKEN-2022 - เร็ว ไม่รอนาน
+// 🆕 FETCH TOKEN-2022 - Timeout นานขึ้น
 // ============================================
 
 async function fetchToken2022Accounts(walletPubKey) {
@@ -132,6 +135,7 @@ async function fetchToken2022Accounts(walletPubKey) {
     try {
       await delay(CONFIG.token2022DelayMs);
       
+      // 🆕 Timeout 60 วินาที
       const result = await Promise.race([
         token2022Conn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_2022_PROGRAM_ID }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), CONFIG.token2022TimeoutMs))
@@ -140,11 +144,21 @@ async function fetchToken2022Accounts(walletPubKey) {
       return { success: true, data: result.value };
 
     } catch (e) {
-      const isTimeout = e.message?.includes('timeout');
+      const isUnsupported = e.message?.includes('not supported') || 
+                           e.message?.includes('Method not found');
       const is429 = e.message?.includes('429');
       
-      if ((isTimeout || is429) && attempt < CONFIG.maxRetries - 1) {
-        await delay(1000); // รอ 1 วิแล้วลองใหม่
+      if (isUnsupported) {
+        console.log(`${c.yellow}    [T2022] RPC doesn't support parsed accounts${c.reset}`);
+        return { success: false, error: 'Not supported', data: [] };
+      }
+      
+      if (is429 && attempt < CONFIG.maxRetries - 1) {
+        const wait = 3000 * Math.pow(2, attempt);
+        console.log(`${c.dim}    [T2022] 429, wait ${wait}ms${c.reset}`);
+        await delay(wait);
+      } else if (attempt < CONFIG.maxRetries - 1) {
+        await delay(2000);
       } else {
         return { success: false, error: e.message, data: [] };
       }
@@ -162,7 +176,7 @@ async function main() {
   const startTime = Date.now();
 
   console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (Fast Token-2022)                ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (No Helius - Long Timeout)       ║${c.reset}`);
   console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}\n`);
 
   if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
@@ -187,7 +201,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Load custom RPC
+  // Load custom RPC from nodes sheet
   const nodesSheet = doc.sheetsByTitle['nodes'];
   if (nodesSheet) {
     try {
@@ -202,6 +216,12 @@ async function main() {
           if (netCell?.value?.toString().toLowerCase() === 'solana' && urlCell?.value) {
             const url = String(urlCell.value).trim();
             const type = typeCell?.value ? String(typeCell.value).toLowerCase().trim() : 'spl';
+            
+            // 🆕 ป้องกันไม่ให้ใช้ Helius
+            if (url.includes('helius')) {
+              console.log(`${c.yellow}⚠ Skip Helius endpoint${c.reset}`);
+              continue;
+            }
             
             if (type === 'token2022') TOKEN2022_RPC_ENDPOINTS.unshift(url);
             else SPL_RPC_ENDPOINTS.unshift(url);
@@ -244,7 +264,7 @@ async function main() {
   console.log(`${c.green}✓ Loaded ${WALLETS.length} wallet(s)${c.reset}`);
 
   // Load Tokens
-  console.log(`${c.cyan}[4/5] Loading tokens...${c.reset}`);
+  console.log(`${c.cyan}[4/5] Loading token subscriptions...${c.reset}`);
   const tokenMap = new Map();
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
   
@@ -293,10 +313,11 @@ async function main() {
   console.log(`${c.green}✓ Sheet ready${c.reset}`);
 
   // ============================================
-  // 🆕 PROCESS WALLETS - เร็วขึ้น
+  // PROCESS WALLETS
   // ============================================
   console.log(`\n${c.cyan}${c.bright}>> Scanning wallets${c.reset}`);
-  console.log(`${c.gray}SPL: ${splConn.rpcEndpoint.split('/')[2]} | T2022: ${token2022Conn ? token2022Conn.rpcEndpoint.split('/')[2] : 'N/A'}${c.reset}\n`);
+  console.log(`${c.gray}SPL: ${splConn.rpcEndpoint.split('/')[2]} | T2022: ${token2022Conn ? token2022Conn.rpcEndpoint.split('/')[2] : 'N/A'}${c.reset}`);
+  console.log(`${c.yellow}⚠ Token-2022 timeout: ${CONFIG.token2022TimeoutMs/1000}s (slow but thorough)${c.reset}\n`);
 
   let totalAdded = 0;
   let totalT2022Found = 0;
@@ -317,7 +338,7 @@ async function main() {
     try {
       const walletPubKey = new PublicKey(wallet.address);
 
-      // 1️⃣ Fetch SPL (เร็ว)
+      // 1️⃣ Fetch SPL
       const splResult = await fetchSPLAccounts(walletPubKey);
       let allAccounts = splResult.success ? splResult.data : [];
       
@@ -325,18 +346,15 @@ async function main() {
         errors.push(`${wallet.name} [SPL]: ${splResult.error}`);
       }
 
-      // 2️⃣ 🆕 Fetch Token-2022 (เร็ว ไม่รอนาน)
+      // 2️⃣ 🆕 Fetch Token-2022 (timeout นานขึ้น)
       const t2022Result = await fetchToken2022Accounts(walletPubKey);
       
       if (t2022Result.success) {
         allAccounts.push(...t2022Result.data);
         walletT2022 = t2022Result.data.length;
         totalT2022Found += walletT2022;
-      } else if (t2022Result.error) {
-        // 🆕 ไม่ log error ถ้า timeout แค่ข้ามไป
-        if (!t2022Result.error.includes('timeout')) {
-          errors.push(`${wallet.name} [T2022]: ${t2022Result.error}`);
-        }
+      } else if (t2022Result.error && !t2022Result.error.includes('timeout')) {
+        errors.push(`${wallet.name} [T2022]: ${t2022Result.error}`);
       }
 
       // Process
@@ -377,7 +395,6 @@ async function main() {
       console.log(`${c.red}✗ ${err.message.substring(0, 50)}${c.reset}`);
     }
 
-    // 🆕 Delay สั้นลง
     await delay(CONFIG.walletDelayMs);
   }
 
