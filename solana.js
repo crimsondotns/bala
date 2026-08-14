@@ -12,6 +12,13 @@
  *  4. ตรวจ program ของ mint จริง — ไม่ต้องเดา SPL vs Token-2022
  *  5. Coverage guard — ไม่ clear() sheet ถ้ารอบนี้ข้อมูลไม่ครบ
  *  6. ไม่ซ่อน error อีกต่อไป — timeout ถูกนับเป็น error เสมอ
+ *
+ * v2.1 — แก้ตาม log รอบ 2026-08-14 (coverage 53.6%)
+ *  1. ตัด endpoint ที่ error rate 100% ออกจาก default list
+ *  2. keep-alive agent + จำกัด socket — แก้ 429 "Connection rate limits exceeded"
+ *  3. แยก permanent error (403/521/free-plan) ออกจาก transient — ปิด endpoint ถาวร
+ *     และไม่ให้กิน retry budget
+ *  4. pick() จัดลำดับด้วย error rate + ไม่ retry ซ้ำ endpoint เดิมในคำขอเดียวกัน
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -25,6 +32,7 @@ import {
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
+import { pathToFileURL } from 'node:url';
 dotenv.config();
 
 // ============================================================
@@ -67,16 +75,29 @@ const CONFIG = {
   breakerCooldownMs: 30000,
   // ขนาด batch ของ getMultipleAccounts (ข้อจำกัด RPC = 100)
   batchSize: 100,
+  // จำนวน TCP socket สูงสุดต่อ 1 origin — mainnet-beta จำกัด "connection rate"
+  // ไม่ใช่ request rate การ reuse socket จึงสำคัญกว่าการลด concurrency
+  maxSockets: Number(process.env.MAX_SOCKETS || 6),
 };
 
-// Public RPC ที่ไม่ต้องใช้ API Key
-// แนะนำให้ทดสอบด้วย curl ก่อน แล้วเก็บเฉพาะตัวที่ตอบ getMultipleAccounts ได้
+/**
+ * Public RPC ที่ไม่ต้องใช้ API Key
+ *
+ * ตัดออกจาก default list เพราะ log 2026-08-14 พบ error rate 100%:
+ *   - solana.drpc.org        → 400 "chain is not available on free plan" (83/83)
+ *   - endpoints.omniatech.io → 521 Cloudflare origin down (80/80)
+ *   - solana-rpc.publicnode.com → 403 "Request blocked" (26/26) บล็อก Azure IP
+ *     ของ GitHub runner และถ่วงเวลา ~3s ก่อนตอบ
+ * เหลือ endpoint เดียวที่ใช้ได้จริง ดีกว่ามี 4 ตัวที่ 3 ตัวกิน retry budget ทิ้ง
+ *
+ * เพิ่ม endpoint เองได้ทาง env EXTRA_RPCS (คั่นด้วย comma) หรือแท็บ "nodes" ใน Sheet
+ */
 const DEFAULT_RPCS = [
-  'https://solana-rpc.publicnode.com',
   'https://api.mainnet-beta.solana.com',
-  'https://solana.drpc.org',
-  'https://endpoints.omniatech.io/v1/sol/mainnet/public',
 ];
+
+const EXTRA_RPCS = String(process.env.EXTRA_RPCS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean);
 
 // ============================================================
 // UTILS
@@ -128,6 +149,59 @@ function jlog(obj) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }));
 }
 
+/**
+ * global fetch ของ Node ใช้ undici ที่ "ไม่จำกัด" จำนวน connection ต่อ origin
+ * ทำให้ยิงพร้อมกันทีเดียวหลาย socket แล้วโดน 429 "Connection rate limits exceeded"
+ * (เป็น limit ที่นับ "การเปิด connection ใหม่" ไม่ใช่จำนวน request)
+ * แก้ด้วยการจำกัด socket + เปิด keep-alive ยาว ๆ เพื่อ reuse socket เดิม
+ */
+async function setupHttpAgent() {
+  try {
+    const { Agent, setGlobalDispatcher } = await import('undici');
+    setGlobalDispatcher(new Agent({
+      connections: CONFIG.maxSockets,
+      pipelining: 1,
+      keepAliveTimeout: 60_000,
+      keepAliveMaxTimeout: 300_000,
+      connect: { timeout: 10_000 },
+    }));
+    return true;
+  } catch (e) {
+    jlog({ evt: 'http_agent_unavailable', msg: (e?.message || '').slice(0, 160) });
+    return false;
+  }
+}
+
+/** ดึง HTTP status จาก error ของ web3.js ซึ่งขึ้นต้นด้วย "<code> <statusText>: <body>" */
+function httpStatusOf(err) {
+  const m = /^(\d{3})\s/.exec(String(err?.message || ''));
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * แยกประเภท error — หัวใจของการไม่เผา retry budget ทิ้ง
+ *   permanent → endpoint นี้จะไม่มีวันตอบได้ในรอบนี้ ปิดถาวร ไม่นับเป็น retry
+ *   ratelimit → รอแล้วลองใหม่ได้ backoff นานหน่อย
+ *   transient → network/timeout/5xx ปกติ retry ได้
+ */
+function classifyError(err) {
+  const msg = String(err?.message || '');
+  const status = httpStatusOf(err);
+
+  if (err?.name === 'AbortError' || /abort/i.test(msg)) return 'transient';
+  if (status === 429 || /too many requests|rate limit/i.test(msg)) return 'ratelimit';
+
+  // ต้องมี API key / จ่ายเงิน / ถูกบล็อก / ไม่ให้บริการ chain นี้
+  if ([401, 402, 403, 404, 410, 451].includes(status)) return 'permanent';
+  // Cloudflare 52x = origin ของ provider ตาย ไม่ใช่ปัญหาชั่วคราวระดับวินาที
+  if (status >= 520 && status <= 527) return 'permanent';
+  // 400 ที่เป็นเรื่องแพ็กเกจ/ความสามารถของ endpoint (ไม่ใช่ request ของเราผิด)
+  if (status === 400 && /free plan|not available|upgrade|unsupported|api key|method not found/i.test(msg)) {
+    return 'permanent';
+  }
+  return 'transient';
+}
+
 // ============================================================
 // RPC LAYER
 // ============================================================
@@ -159,8 +233,10 @@ class RpcPool {
       url: u,
       host: (() => { try { return new URL(u).host; } catch { return u; } })(),
       conn: makeConn(u, timeoutMs),
-      fails: 0,
+      consecFails: 0,
       openUntil: 0,
+      disabled: false,
+      disabledReason: '',
       inflight: 0,
       calls: 0,
       errors: 0,
@@ -169,29 +245,69 @@ class RpcPool {
     if (!this.nodes.length) throw new Error('RpcPool: ไม่มี endpoint');
   }
 
-  pick() {
+  /** endpoint ที่ยังไม่ถูกปิดถาวร */
+  usable() { return this.nodes.filter((n) => !n.disabled); }
+
+  /**
+   * เลือก endpoint โดยใช้ "error rate" เป็นเกณฑ์หลัก
+   *
+   * ของเดิมเรียงด้วย inflight ก่อน ซึ่งกลับหัวกลับหาง: endpoint ที่ตายจะมี
+   * inflight = 0 เสมอ (fail ทันที) จึงถูกเลือกก่อนตัวที่ดีที่กำลังทำงานอยู่
+   *
+   * @param exclude Set ของ host ที่ลองไปแล้วในคำขอนี้ — กัน retry ซ้ำที่เดิม
+   */
+  pick(exclude) {
     const now = Date.now();
-    const avail = this.nodes.filter((n) => now > n.openUntil);
-    const pool = avail.length ? avail : this.nodes; // ถ้าเปิดวงจรหมด ใช้ที่มี
-    return pool.sort((a, b) => a.inflight - b.inflight || a.fails - b.fails)[0];
+    const usable = this.usable();
+    if (!usable.length) return null;
+
+    const open = usable.filter((n) => now > n.openUntil);
+    let pool = open.filter((n) => !exclude?.has(n.host));
+    if (!pool.length) pool = open;          // ลองครบทุกตัวแล้ว → วนกลับตัวที่ดีที่สุด
+    if (!pool.length) pool = usable;        // breaker เปิดหมด → ยอมใช้เท่าที่มี
+
+    const rate = (n) => (n.calls ? n.errors / n.calls : 0);
+    return pool.sort((a, b) =>
+      rate(a) - rate(b) ||
+      a.inflight - b.inflight ||
+      a.calls - b.calls
+    )[0];
   }
 
-  ok(n) { n.fails = 0; }
+  ok(n) { n.consecFails = 0; }
 
   fail(n) {
     n.errors++;
-    if (++n.fails >= CONFIG.breakerThreshold) {
+    if (++n.consecFails >= CONFIG.breakerThreshold) {
       n.openUntil = Date.now() + CONFIG.breakerCooldownMs;
-      n.fails = 0;
+      n.consecFails = 0;
       jlog({ evt: 'breaker_open', host: n.host, cooldownMs: CONFIG.breakerCooldownMs });
     }
+  }
+
+  /** ปิด endpoint ถาวรสำหรับรอบนี้ — ใช้กับ error ที่ retry ไปก็ไม่มีทางหาย */
+  disable(n, reason) {
+    if (n.disabled) return;
+    n.disabled = true;
+    n.disabledReason = reason;
+    jlog({
+      evt: 'endpoint_disabled', host: n.host, reason,
+      remaining: this.usable().length,
+    });
   }
 
   /** เรียก RPC พร้อม retry + สลับ endpoint + exponential backoff + jitter */
   async call(fn, label = 'rpc') {
     let lastErr;
-    for (let i = 0; i < CONFIG.maxRetries; i++) {
-      const n = this.pick();
+    const tried = new Set();
+    let attempt = 0;
+    // guard กันวนไม่รู้จบ: retry budget + โอกาสปิด endpoint ที่ตายทีละตัว
+    let guard = CONFIG.maxRetries + this.nodes.length + 1;
+
+    while (attempt < CONFIG.maxRetries && guard-- > 0) {
+      const n = this.pick(tried);
+      if (!n) break;
+
       n.inflight++;
       n.calls++;
       const t0 = Date.now();
@@ -204,30 +320,45 @@ class RpcPool {
         n.totalMs += Date.now() - t0;
         lastErr = e;
         this.fail(n);
-        const aborted = e?.name === 'AbortError' || /abort/i.test(e?.message || '');
-        const is429 = /429|too many requests|rate/i.test(e?.message || '');
+        tried.add(n.host);
+
+        const kind = classifyError(e);
         jlog({
-          evt: 'rpc_retry', label, host: n.host, attempt: i + 1,
-          ms: Date.now() - t0,
-          reason: aborted ? 'timeout' : is429 ? '429' : 'error',
+          evt: 'rpc_retry', label, host: n.host,
+          attempt: attempt + 1, ms: Date.now() - t0, kind,
+          status: httpStatusOf(e) || undefined,
           msg: (e?.message || '').slice(0, 160),
         });
-        if (i < CONFIG.maxRetries - 1) {
-          const base = is429 ? 2000 : 500;
-          const wait = Math.min(15000, base * 2 ** i) * (0.7 + Math.random() * 0.6);
+
+        if (kind === 'permanent') {
+          // endpoint นี้ใช้ไม่ได้เลย — ปิดทิ้งแล้วไปตัวถัดไปทันที
+          // ไม่นับเป็น retry เพราะไม่ใช่ความผิดของ request
+          this.disable(n, `${httpStatusOf(e) || 'error'}`);
+          continue;
+        }
+
+        attempt++;
+        if (attempt < CONFIG.maxRetries) {
+          const base = kind === 'ratelimit' ? 2000 : 500;
+          const wait = Math.min(15000, base * 2 ** (attempt - 1)) * (0.7 + Math.random() * 0.6);
           await delay(wait);
         }
       } finally {
         n.inflight--;
       }
     }
-    throw lastErr;
+
+    if (!this.usable().length) {
+      throw new Error('RPC endpoint ใช้ไม่ได้ทั้งหมด (ถูกปิดถาวรหมดแล้ว)');
+    }
+    throw lastErr ?? new Error('ไม่มี RPC endpoint ที่พร้อมใช้งาน');
   }
 
   stats() {
     return this.nodes.map((n) => ({
       host: n.host, calls: n.calls, errors: n.errors,
       avgMs: n.calls ? Math.round(n.totalMs / n.calls) : 0,
+      disabled: n.disabled, disabledReason: n.disabledReason,
     }));
   }
 }
@@ -466,10 +597,15 @@ async function main() {
 
   // ---- [3/5] RPC Pool ----
   console.log(`${c.cyan}[3/5] ตั้งค่า RPC pool...${c.reset}`);
-  const rpcUrls = [...new Set([...customRpcs, ...DEFAULT_RPCS])];
+  const agentOk = await setupHttpAgent();
+  const rpcUrls = [...new Set([...customRpcs, ...EXTRA_RPCS, ...DEFAULT_RPCS])];
   const pool = new RpcPool(rpcUrls, CONFIG.rpcTimeoutMs);
   rpcUrls.forEach((u) => console.log(`${c.gray}  • ${u}${c.reset}`));
-  console.log(`${c.gray}  timeout=${CONFIG.rpcTimeoutMs}ms concurrency=${CONFIG.concurrency} retries=${CONFIG.maxRetries}${c.reset}`);
+  console.log(`${c.gray}  timeout=${CONFIG.rpcTimeoutMs}ms concurrency=${CONFIG.concurrency} ` +
+    `retries=${CONFIG.maxRetries} maxSockets=${CONFIG.maxSockets} keepAlive=${agentOk ? 'on' : 'off'}${c.reset}`);
+  if (!agentOk) {
+    console.log(`${c.yellow}⚠ ตั้ง keep-alive agent ไม่ได้ (ไม่พบ undici) — เสี่ยงโดน 429 connection-rate${c.reset}`);
+  }
 
   // ---- [4/5] ตรวจ program + decimals ของทุก mint ----
   console.log(`${c.cyan}[4/5] ตรวจ program/decimals ของ mint...${c.reset}`);
@@ -490,6 +626,13 @@ async function main() {
     console.error(`${c.red}✗ resolve mint ไม่ได้เลย — RPC น่าจะมีปัญหาทั้งหมด${c.reset}`);
     process.exit(1);
   }
+  // ถ้า endpoint ถูกปิดถาวรจนหมดตั้งแต่ขั้นนี้ สแกนต่อไปก็ล้มเหลวทุก wallet
+  if (!pool.usable().length) {
+    console.error(`${c.red}✗ RPC endpoint ถูกปิดถาวรทั้งหมด — หยุดก่อนสแกน${c.reset}`);
+    pool.stats().forEach((s) => console.error(`${c.red}    ${s.host}: ${s.disabledReason}${c.reset}`));
+    process.exit(1);
+  }
+  console.log(`${c.gray}  RPC ที่ใช้ได้: ${pool.usable().map((n) => n.host).join(', ')}${c.reset}`);
 
   // ---- [5/5] เตรียม sheet ----
   console.log(`${c.cyan}[5/5] เตรียม sheet ปลายทาง...${c.reset}`);
@@ -604,7 +747,10 @@ async function main() {
 
   console.log(`${c.gray}— RPC stats —${c.reset}`);
   for (const s of pool.stats()) {
-    console.log(`${c.gray}  ${s.host.padEnd(42)} calls=${String(s.calls).padStart(5)} errors=${String(s.errors).padStart(4)} avg=${s.avgMs}ms${c.reset}`);
+    const rate = s.calls ? ((s.errors / s.calls) * 100).toFixed(0) : '0';
+    const flag = s.disabled ? `${c.red} [DISABLED:${s.disabledReason}]${c.reset}` : '';
+    console.log(`${c.gray}  ${s.host.padEnd(42)} calls=${String(s.calls).padStart(5)} ` +
+      `errors=${String(s.errors).padStart(4)} (${rate.padStart(3)}%) avg=${s.avgMs}ms${c.reset}${flag}`);
   }
 
   if (errors.length) {
@@ -619,7 +765,15 @@ async function main() {
   // ไม่ใช้ process.exit() เพื่อให้ stdout flush ครบ (log บรรทัดท้ายไม่หาย)
 }
 
-main().catch((err) => {
-  console.error(`${c.red}${c.bright}Fatal Error:${c.reset} ${err?.stack || err?.message || err}`);
-  process.exitCode = 1;
-});
+// รันเฉพาะตอนถูกเรียกเป็นสคริปต์ — ทำให้ import มาเทสต์ RpcPool ได้โดยไม่สแกนจริง
+const isCli = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isCli) {
+  main().catch((err) => {
+    console.error(`${c.red}${c.bright}Fatal Error:${c.reset} ${err?.stack || err?.message || err}`);
+    process.exitCode = 1;
+  });
+}
+
+export { RpcPool, classifyError, httpStatusOf, CONFIG };
