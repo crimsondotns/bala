@@ -128,6 +128,42 @@ const DEFAULT_RPCS = [
 const EXTRA_RPCS = String(process.env.EXTRA_RPCS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 
+/**
+ * Host ที่ "รู้แล้วว่าใช้ไม่ได้จาก GitHub runner" — ข้ามตั้งแต่ต้นไม่ต้องลองซ้ำ
+ *
+ * ต่างจากการปิด endpoint ระหว่างรัน (ซึ่งต้องเสียคำขอไป 1 ครั้งเพื่อค้นพบ):
+ * publicnode ถ่วงเวลา ~3.1 วินาทีก่อนตอบ 403 ทุกครั้ง จึงกินเวลาเริ่มงาน
+ * ทุกรอบทั้งที่รู้ผลอยู่แล้ว
+ *
+ * ทำที่โค้ดเพื่อให้แถวใน Sheet ที่ยังค้างอยู่ไม่มีผล — คนใช้ Sheet ไม่ต้องตามลบ
+ * ถ้าอยากลองอีกครั้ง (เช่นย้ายไปรันที่อื่นที่ IP ไม่ถูกบล็อก) ตั้ง ALLOW_BLOCKED_RPCS=1
+ */
+const KNOWN_BLOCKED_HOSTS = new Map([
+  ['solana-rpc.publicnode.com', 'บล็อก IP ของ GitHub runner (403) และถ่วงเวลา ~3 วินาทีก่อนตอบ'],
+  ['solana.drpc.org', 'แพ็กเกจฟรีไม่รองรับ Solana อีกแล้ว (400)'],
+  ['endpoints.omniatech.io', 'เซิร์ฟเวอร์ปลายทางไม่ตอบ (521)'],
+]);
+
+const ALLOW_BLOCKED_RPCS = process.env.ALLOW_BLOCKED_RPCS === '1';
+
+/** คัด host ที่รู้ว่าใช้ไม่ได้ออก พร้อมบอกเหตุผลให้ชัดว่าทำไมถูกข้าม */
+function filterKnownBlocked(urls) {
+  if (ALLOW_BLOCKED_RPCS) return urls;
+  const kept = [];
+  for (const u of urls) {
+    let host = '';
+    try { host = new URL(u).host; } catch { /* ปล่อยผ่านให้ RpcPool จัดการ */ }
+    const reason = KNOWN_BLOCKED_HOSTS.get(host);
+    if (reason) {
+      console.log(`  ${c.yellow}⏭${c.reset} ${c.gray}${host.padEnd(30)}${c.reset} ` +
+        `ข้ามเพราะ${reason} ${c.dim}(บังคับใช้ได้ด้วย ALLOW_BLOCKED_RPCS=1)${c.reset}`);
+      continue;
+    }
+    kept.push(u);
+  }
+  return kept;
+}
+
 // ============================================================
 // UTILS
 // ============================================================
@@ -890,9 +926,16 @@ async function main() {
   // ---- [3/5] RPC Pool ----
   console.log(`${c.cyan}[3/5] ตั้งค่า RPC pool...${c.reset}`);
   const agentOk = await setupHttpAgent();
-  const rpcUrls = [...new Set([...customRpcs, ...EXTRA_RPCS, ...DEFAULT_RPCS])];
+  const requested = [...new Set([...customRpcs, ...EXTRA_RPCS, ...DEFAULT_RPCS])];
+  const rpcUrls = filterKnownBlocked(requested);
+  if (!rpcUrls.length) {
+    console.error(`${c.red}✗ ไม่เหลือเซิร์ฟเวอร์ที่ใช้ได้ — endpoint ทั้งหมดอยู่ในรายการที่ถูกข้าม${c.reset}`);
+    console.error(`${c.gray}  เพิ่มตัวใหม่ทาง EXTRA_RPCS หรือแท็บ nodes ` +
+      `หรือตั้ง ALLOW_BLOCKED_RPCS=1 เพื่อลองใช้ตัวที่ถูกข้าม${c.reset}`);
+    process.exit(1);
+  }
   const pool = new RpcPool(rpcUrls, CONFIG.rpcTimeoutMs);
-  rpcUrls.forEach((u) => console.log(`${c.gray}  • ${u}${c.reset}`));
+  rpcUrls.forEach((u) => console.log(`  ${c.green}•${c.reset} ${c.gray}${u}${c.reset}`));
   console.log(`${c.gray}  timeout=${CONFIG.rpcTimeoutMs}ms concurrency=${CONFIG.concurrency} ` +
     `retries=${CONFIG.maxRetries} maxSockets=${CONFIG.maxSockets} keepAlive=${agentOk ? 'on' : 'off'} ` +
     `rate=${CONFIG.rateLimitRps}req/s${c.reset}`);
@@ -1133,4 +1176,5 @@ export {
   computeCoverage, scanWalletByAta,
   createRateLimiter, parseRetryAfter,
   explainStatus, printTally, printLegend, USE_COLOR,
+  filterKnownBlocked, KNOWN_BLOCKED_HOSTS,
 };
