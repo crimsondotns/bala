@@ -19,6 +19,11 @@
  *  3. แยก permanent error (403/521/free-plan) ออกจาก transient — ปิด endpoint ถาวร
  *     และไม่ให้กิน retry budget
  *  4. pick() จัดลำดับด้วย error rate + ไม่ retry ซ้ำ endpoint เดิมในคำขอเดียวกัน
+ *
+ * v2.2
+ *  5. batch ที่พังไม่ทิ้งผลของ batch อื่น — รายงานเป็น partial
+ *  6. coverage นับ mint ที่ resolve ไม่ได้ + batch ที่พัง (ของเดิมเห็นแค่ wallet)
+ *  7. เลขลำดับ log ใช้ index ของ wallet ไม่ใช่ลำดับที่ทำเสร็จ
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -123,6 +128,16 @@ function toUiAmount(raw, decimals) {
   const int = s.slice(0, s.length - decimals);
   const frac = s.slice(s.length - decimals);
   return Number(`${int}.${frac}`);
+}
+
+/**
+ * สัดส่วนข้อมูลที่ได้จริงในรอบนี้ = (mint ที่ resolve ได้) × (ช่องที่ตรวจได้)
+ * แยกออกมาเป็นฟังก์ชันบริสุทธิ์เพื่อให้เทสต์ตรรกะ guard ได้โดยไม่ต้องยิง RPC
+ */
+function computeCoverage({ tokenCount, mintFailed, cellsChecked, cellsAttempted }) {
+  const mint = tokenCount ? 1 - mintFailed / tokenCount : 1;
+  const cells = cellsAttempted ? cellsChecked / cellsAttempted : 0;
+  return { mint, cells, total: mint * cells };
 }
 
 /** ตัวจำกัด concurrency แบบ inline — ไม่ต้องลง p-limit เพิ่ม */
@@ -412,7 +427,13 @@ async function resolveMints(pool, mints) {
 // WALLET SCAN
 // ============================================================
 
-/** สแกน 1 wallet ด้วย ATA — 599 mints = ~6 requests */
+/**
+ * สแกน 1 wallet ด้วย ATA — 599 mints = ~6 requests
+ *
+ * batch ที่พังจะไม่ทำให้ batch ที่สำเร็จไปแล้วสูญเปล่าอีกต่อไป
+ * (ของเดิม throw ออกจาก loop = ทิ้งผลของ batch ก่อนหน้าทั้งหมด)
+ * คืน attempted/checked เพื่อให้ coverage guard รู้ว่า "เช็คไปกี่ช่องจริง ๆ"
+ */
 async function scanWalletByAta(pool, wallet, mintInfoMap) {
   const owner = new PublicKey(wallet.address);
 
@@ -429,12 +450,31 @@ async function scanWalletByAta(pool, wallet, mintInfoMap) {
   }
 
   const found = [];
+  let checked = 0;
+  let failedBatches = 0;
+  let totalBatches = 0;
+  let lastError = null;
+
   for (let i = 0; i < targets.length; i += CONFIG.batchSize) {
     const batch = targets.slice(i, i + CONFIG.batchSize);
-    const infos = await pool.call(
-      (conn) => conn.getMultipleAccountsInfo(batch.map((t) => t.ata)),
-      `scan:${wallet.name}`
-    );
+    totalBatches++;
+    let infos;
+    try {
+      infos = await pool.call(
+        (conn) => conn.getMultipleAccountsInfo(batch.map((t) => t.ata)),
+        `scan:${wallet.name}`
+      );
+    } catch (e) {
+      // เก็บผลของ batch อื่นไว้ แล้วไปต่อ — รายงานเป็น partial ทีหลัง
+      failedBatches++;
+      lastError = e;
+      jlog({
+        evt: 'batch_failed', wallet: wallet.name, batch: totalBatches,
+        size: batch.length, msg: (e?.message || '').slice(0, 160),
+      });
+      continue;
+    }
+    checked += batch.length;
     infos.forEach((info, j) => {
       if (!info) return; // ATA ยังไม่ถูกสร้าง = ไม่ถือ token นี้
       const t = batch[j];
@@ -448,7 +488,11 @@ async function scanWalletByAta(pool, wallet, mintInfoMap) {
       } catch { /* ไม่ใช่ token account ที่ถูกต้อง */ }
     });
   }
-  return found;
+
+  return {
+    found, attempted: targets.length, checked,
+    failedBatches, totalBatches, lastError,
+  };
 }
 
 /**
@@ -457,12 +501,30 @@ async function scanWalletByAta(pool, wallet, mintInfoMap) {
  */
 async function scanWalletFull(pool, wallet, mintInfoMap) {
   const owner = new PublicKey(wallet.address);
+  const programs = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID];
   const found = [];
-  for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
-    const res = await pool.call(
-      (conn) => conn.getTokenAccountsByOwner(owner, { programId }),
-      `full:${wallet.name}`
-    );
+  let okPrograms = 0;
+  let failedBatches = 0;
+  let lastError = null;
+
+  for (const programId of programs) {
+    let res;
+    try {
+      res = await pool.call(
+        (conn) => conn.getTokenAccountsByOwner(owner, { programId }),
+        `full:${wallet.name}`
+      );
+    } catch (e) {
+      // program หนึ่งพัง ไม่ควรทิ้งผลของอีก program — เหมือน batch ใน ATA mode
+      failedBatches++;
+      lastError = e;
+      jlog({
+        evt: 'batch_failed', wallet: wallet.name, mode: 'full',
+        program: programId.toBase58(), msg: (e?.message || '').slice(0, 160),
+      });
+      continue;
+    }
+    okPrograms++;
     for (const { pubkey, account } of res.value) {
       try {
         const acc = unpackAccount(pubkey, account, programId);
@@ -474,7 +536,14 @@ async function scanWalletFull(pool, wallet, mintInfoMap) {
       } catch { /* skip */ }
     }
   }
-  return found;
+
+  // full scan ไม่ได้ไล่ทีละ mint จึงประมาณ "ช่องที่เช็คได้" จากสัดส่วน program ที่สำเร็จ
+  const attempted = mintInfoMap.size;
+  return {
+    found, attempted,
+    checked: Math.round((attempted * okPrograms) / programs.length),
+    failedBatches, totalBatches: programs.length, lastError,
+  };
 }
 
 // ============================================================
@@ -651,16 +720,24 @@ async function main() {
   const limit = createLimiter(CONFIG.concurrency);
   const rowsToAdd = [];
   const errors = [];
-  let okCount = 0;
+  let okCount = 0;        // wallet ที่สแกนครบทุก batch
+  let partialCount = 0;   // wallet ที่ได้ข้อมูลบางส่วน
   let t2022Rows = 0;
-  let done = 0;
+  let cellsChecked = 0;   // จำนวนช่อง (wallet × mint) ที่เช็คได้จริง
+  let cellsAttempted = 0; // จำนวนช่องที่ตั้งใจจะเช็ค
 
-  await Promise.all(wallets.map((wallet) => limit(async () => {
+  await Promise.all(wallets.map((wallet, wIdx) => limit(async () => {
     const t0 = Date.now();
+    // ใช้ index ของ wallet ไม่ใช่ลำดับที่ทำเสร็จ — ของเดิมเลขสลับเพราะรันขนาน
+    const tag0 = `${c.gray}[${String(wIdx + 1).padStart(3, '0')}/${wallets.length}]${c.reset}`;
     try {
-      const found = CONFIG.fullScan
+      const res = CONFIG.fullScan
         ? await scanWalletFull(pool, wallet, mintInfoMap)
         : await scanWalletByAta(pool, wallet, mintInfoMap);
+      const { found, attempted, checked, failedBatches, totalBatches, lastError } = res;
+
+      cellsAttempted += attempted;
+      cellsChecked += checked;
 
       const now = formatDate(new Date());
       let w2022 = 0;
@@ -678,22 +755,31 @@ async function main() {
         });
       }
 
-      okCount++;
-      done++;
+      const allFailed = failedBatches > 0 && failedBatches === totalBatches;
       const tag = w2022 ? ` ${c.magenta}[T2022:${w2022}]${c.reset}` : '';
-      console.log(
-        `${c.gray}[${String(done).padStart(3, '0')}/${wallets.length}]${c.reset} ` +
-        `${wallet.name.padEnd(35, ' ')} ` +
-        `${found.length ? c.green : c.gray}✓ ${String(found.length).padStart(2, '0')} tokens${c.reset}` +
-        `${tag} ${c.dim}(${((Date.now() - t0) / 1000).toFixed(1)}s)${c.reset}`
-      );
+      const took = `${c.dim}(${((Date.now() - t0) / 1000).toFixed(1)}s)${c.reset}`;
+
+      if (allFailed) {
+        errors.push(`${wallet.name}: ${lastError?.message || lastError}`);
+        console.log(`${tag0} ${wallet.name.padEnd(35, ' ')} ${c.red}✗ FAILED${c.reset} ${took} ` +
+          `${c.red}${String(lastError?.message || lastError).slice(0, 60)}${c.reset}`);
+      } else if (failedBatches > 0) {
+        // ได้ข้อมูลบางส่วน — เก็บไว้ แต่ต้องไม่นับเป็นสำเร็จเต็ม
+        partialCount++;
+        errors.push(`${wallet.name} [partial ${checked}/${attempted}]: ${lastError?.message || lastError}`);
+        console.log(`${tag0} ${wallet.name.padEnd(35, ' ')} ` +
+          `${c.yellow}⚠ ${String(found.length).padStart(2, '0')} tokens (บางส่วน ${checked}/${attempted})${c.reset}${tag} ${took}`);
+      } else {
+        okCount++;
+        console.log(`${tag0} ${wallet.name.padEnd(35, ' ')} ` +
+          `${found.length ? c.green : c.gray}✓ ${String(found.length).padStart(2, '0')} tokens${c.reset}${tag} ${took}`);
+      }
     } catch (e) {
-      done++;
       // สำคัญ: timeout ก็นับเป็น error — ไม่ซ่อนเหมือนเวอร์ชันเดิม
+      cellsAttempted += mintInfoMap.size;
       errors.push(`${wallet.name}: ${e?.message || e}`);
       console.log(
-        `${c.gray}[${String(done).padStart(3, '0')}/${wallets.length}]${c.reset} ` +
-        `${wallet.name.padEnd(35, ' ')} ` +
+        `${tag0} ${wallet.name.padEnd(35, ' ')} ` +
         `${c.red}✗ FAILED${c.reset} ${c.dim}(${((Date.now() - t0) / 1000).toFixed(1)}s)${c.reset} ` +
         `${c.red}${String(e?.message || e).slice(0, 60)}${c.reset}`
       );
@@ -703,8 +789,23 @@ async function main() {
   // ============================================================
   // COVERAGE GUARD + WRITE
   // ============================================================
-  const coverage = okCount / wallets.length;
-  console.log(`\n${c.cyan}${c.bright}>> Coverage: ${(coverage * 100).toFixed(1)}% (${okCount}/${wallets.length})${c.reset}`);
+  /**
+   * Coverage ต้องวัด "ข้อมูลที่ได้จริง" ไม่ใช่แค่ wallet ที่ไม่ throw
+   *
+   * ของเดิมนับแค่ okCount/wallets ซึ่งมองไม่เห็น 2 ทาง:
+   *   - mint ที่ resolve ไม่สำเร็จ → หายจากทุก wallet โดย coverage ยังขึ้น 100%
+   *   - batch ที่พังบางส่วน → ตอนนี้ wallet ไม่ throw แล้ว จึงต้องนับระดับช่อง
+   * จึงวัดเป็นสัดส่วนของช่อง (wallet × mint) ที่ตรวจได้จริง
+   */
+  const {
+    mint: mintCoverage, cells: cellCoverage, total: coverage,
+  } = computeCoverage({
+    tokenCount: tokenMap.size, mintFailed, cellsChecked, cellsAttempted,
+  });
+
+  console.log(`\n${c.cyan}${c.bright}>> Coverage: ${(coverage * 100).toFixed(1)}%${c.reset}` +
+    `${c.gray}  (mint ${(mintCoverage * 100).toFixed(1)}% × cells ${(cellCoverage * 100).toFixed(1)}%` +
+    ` | wallet ครบ ${okCount}/${wallets.length}, บางส่วน ${partialCount})${c.reset}`);
 
   let wrote = false;
   if (coverage < CONFIG.minCoverage) {
@@ -741,7 +842,9 @@ async function main() {
   console.log(`${c.cyan}${c.bright}╚══════════════════════════════════════════════════════════╝${c.reset}`);
   console.log(`${c.gray}เวลา: ${(secs / 60).toFixed(1)} นาที (${secs.toFixed(0)}s) | Wallets: ${wallets.length}${c.reset}`);
   console.log(`${c.gray}Coverage: ${(coverage * 100).toFixed(1)}% | เขียน Sheet: ${wrote ? 'ใช่' : 'ไม่'}${c.reset}`);
-  console.log(`${c.gray}Mint resolve: ${mintInfoMap.size}/${tokenMap.size} (Token-2022 mints: ${n2022})${c.reset}`);
+  console.log(`${c.gray}Wallet: ครบ ${okCount} | บางส่วน ${partialCount} | ล้มเหลว ${wallets.length - okCount - partialCount}${c.reset}`);
+  console.log(`${c.gray}Cells: ${cellsChecked}/${cellsAttempted} | Mint resolve: ${mintInfoMap.size}/${tokenMap.size} ` +
+    `(ล้มเหลว ${mintFailed}, Token-2022 mints: ${n2022})${c.reset}`);
   console.log(`${c.magenta}Token-2022 holdings พบ: ${t2022Rows}${c.reset}`);
   console.log(`${c.green}Records: ${rowsToAdd.length}${c.reset}`);
 
@@ -776,4 +879,7 @@ if (isCli) {
   });
 }
 
-export { RpcPool, classifyError, httpStatusOf, CONFIG };
+export {
+  RpcPool, classifyError, httpStatusOf, CONFIG,
+  computeCoverage, scanWalletByAta,
+};
