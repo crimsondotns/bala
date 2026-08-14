@@ -48,10 +48,25 @@ const c = {
   reset: '\x1b[0m', bright: '\x1b[1m', dim: '\x1b[2m',
   cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m',
   red: '\x1b[31m', gray: '\x1b[90m', magenta: '\x1b[35m',
+  blue: '\x1b[34m', white: '\x1b[97m',
 };
-// ปิดสีอัตโนมัติเมื่อไม่ใช่ TTY (เช่นบน GitHub Actions) เพื่อให้ log อ่านง่าย
-const USE_COLOR = process.stdout.isTTY && process.env.NO_COLOR !== '1';
+
+/**
+ * GitHub Actions รองรับ ANSI เต็มรูปแบบ แต่ไม่ใช่ TTY
+ * การเช็ค isTTY อย่างเดียวจึงปิดสีทิ้งทั้งที่ใช้ได้ — ต้องเช็ค CI ด้วย
+ * ปิดสีได้ด้วย NO_COLOR=1 (มาตรฐาน no-color.org) บังคับเปิดด้วย FORCE_COLOR=1
+ */
+const USE_COLOR = (() => {
+  if (process.env.NO_COLOR) return false;
+  if (process.env.FORCE_COLOR) return process.env.FORCE_COLOR !== '0';
+  return Boolean(process.stdout.isTTY || process.env.GITHUB_ACTIONS || process.env.CI);
+})();
 if (!USE_COLOR) for (const k of Object.keys(c)) c[k] = '';
+
+/** LOG_JSON=1 กลับไปใช้ JSON บรรทัดเดียวสำหรับเครื่องอ่าน/grep */
+const LOG_JSON = process.env.LOG_JSON === '1';
+/** แสดงเหตุการณ์ซ้ำ ๆ กี่ครั้งก่อนจะย่อเหลือแค่ตัวนับ */
+const LOG_SAMPLE = Number(process.env.LOG_SAMPLE || 3);
 
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY
@@ -203,9 +218,115 @@ function createLimiter(max) {
   });
 }
 
-/** log แบบ JSON บรรทัดเดียว — grep/analyze ได้จริง */
+/** log แบบ JSON บรรทัดเดียว — ใช้เมื่อ LOG_JSON=1 หรือสำหรับเครื่องอ่าน */
 function jlog(obj) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }));
+}
+
+// ============================================================
+// LOGGING — อ่านรู้เรื่องโดยไม่ต้องอ่านโค้ด
+// ============================================================
+
+/**
+ * แปลรหัส HTTP เป็นภาษาคน โดย "คงรหัสไว้" เสมอ
+ * คนอ่าน log ควรรู้ว่าเกิดอะไรขึ้นโดยไม่ต้องไปเปิดเอกสาร แต่ยังค้นด้วยรหัสได้
+ */
+function explainStatus(status, msg = '') {
+  switch (status) {
+    case 400:
+      if (/free plan|upgrade/i.test(msg)) return 'แพ็กเกจฟรีของผู้ให้บริการไม่รองรับเครือข่ายนี้';
+      if (/method not found|unsupported/i.test(msg)) return 'เซิร์ฟเวอร์ไม่รองรับคำสั่งที่เราเรียก';
+      return 'คำขอไม่ถูกต้อง';
+    case 401: return 'ต้องมี API key ถึงจะใช้ได้';
+    case 402: return 'ต้องเสียเงินถึงจะใช้ได้';
+    case 403: return 'เซิร์ฟเวอร์ปฏิเสธคำขอ (มักเป็นการบล็อก IP)';
+    case 404: return 'ไม่พบปลายทาง (URL อาจผิด)';
+    case 429: return 'เราส่งคำขอถี่เกินที่เซิร์ฟเวอร์ยอมให้';
+    case 451: return 'ถูกจำกัดด้วยเหตุผลทางกฎหมาย';
+    case 500: case 502: case 503: case 504:
+      return 'เซิร์ฟเวอร์ขัดข้องชั่วคราว';
+    default:
+      if (status >= 520 && status <= 527) return 'เซิร์ฟเวอร์ปลายทางไม่ตอบ (Cloudflare)';
+      if (status) return `เซิร์ฟเวอร์ตอบรหัส ${status}`;
+      if (/abort/i.test(msg)) return `ไม่ตอบภายใน ${CONFIG.rpcTimeoutMs / 1000} วินาที`;
+      return 'ติดต่อเซิร์ฟเวอร์ไม่สำเร็จ';
+  }
+}
+
+/** เหตุการณ์ซ้ำ ๆ ถูกนับรวมแทนการพิมพ์ทุกครั้ง — 247 บรรทัดเดิม ๆ ไม่ช่วยใคร */
+const tally = new Map();
+
+function bumpTally(key, meta) {
+  const cur = tally.get(key) || { count: 0, ...meta };
+  cur.count++;
+  tally.set(key, cur);
+  return cur.count;
+}
+
+/** พิมพ์ 1 บรรทัดแบบคอลัมน์คงที่: ไอคอน | รหัส | เซิร์ฟเวอร์ | คำอธิบาย */
+function logEvent({ icon, color, status, host, text, detail }) {
+  const code = status ? String(status) : '—';
+  const line =
+    `  ${color}${icon}${c.reset} ` +
+    `${color}${code.padEnd(3)}${c.reset} ` +
+    `${c.gray}${String(host).padEnd(30)}${c.reset} ` +
+    `${text}` +
+    (detail ? ` ${c.dim}${detail}${c.reset}` : '');
+  console.log(line);
+}
+
+/** ไอคอน + สี ต่อชนิดเหตุการณ์ */
+const STYLE = {
+  retry:    { icon: '↻', color: c.yellow },
+  ratelimit:{ icon: '⏳', color: c.yellow },
+  disabled: { icon: '⏭', color: c.red },
+  paused:   { icon: '⏸', color: c.yellow },
+  failed:   { icon: '✖', color: c.red },
+};
+
+function logRpcEvent(kind, { host, status, msg, text, detail, evt, extra }) {
+  if (LOG_JSON) {
+    jlog({ evt, host, status, ...extra, msg: (msg || '').slice(0, 160) });
+    return;
+  }
+  const key = `${evt}|${host}|${status || 0}`;
+  const n = bumpTally(key, { evt, host, status, text });
+  const s = STYLE[kind] || STYLE.retry;
+
+  if (n <= LOG_SAMPLE) {
+    logEvent({ ...s, status, host, text, detail });
+  } else if (n === LOG_SAMPLE + 1) {
+    console.log(`  ${c.dim}⋯ เหตุการณ์แบบเดียวกันนี้จะถูกนับรวมไว้ท้ายสุด แทนการพิมพ์ซ้ำ${c.reset}`);
+  }
+}
+
+/** ตารางสรุปเหตุการณ์ทั้งหมดที่เกิดขึ้น — แทนการไล่อ่าน log ทีละบรรทัด */
+function printTally() {
+  if (!tally.size) return;
+  console.log(`\n${c.bright}เหตุการณ์ที่พบระหว่างทำงาน${c.reset}`);
+  const rows = [...tally.values()].sort((a, b) => b.count - a.count);
+  for (const r of rows) {
+    const code = r.status ? String(r.status) : '—';
+    const color = r.status === 429 ? c.yellow : r.status ? c.red : c.gray;
+    console.log(
+      `  ${color}${code.padEnd(3)}${c.reset} ` +
+      `${c.gray}${String(r.host).padEnd(30)}${c.reset} ` +
+      `${String(r.count).padStart(4)} ครั้ง  ${c.dim}${r.text}${c.reset}`
+    );
+  }
+}
+
+/** คำอธิบายสัญลักษณ์ — พิมพ์ครั้งเดียวก่อนเริ่มงานจริง */
+function printLegend() {
+  if (LOG_JSON) return;
+  console.log(`${c.dim}สัญลักษณ์: ` +
+    `${c.green}✓${c.dim} สำเร็จ  ` +
+    `${c.yellow}⚠${c.dim} ได้ข้อมูลบางส่วน  ` +
+    `${c.red}✖${c.dim} ล้มเหลว  ` +
+    `${c.yellow}↻${c.dim} ลองใหม่  ` +
+    `${c.yellow}⏳${c.dim} ชะลอความเร็ว  ` +
+    `${c.yellow}⏸${c.dim} พักชั่วคราว  ` +
+    `${c.red}⏭${c.dim} เลิกใช้เซิร์ฟเวอร์นี้${c.reset}`);
 }
 
 /**
@@ -295,6 +416,7 @@ class RpcPool {
     this.acquire = opts.rateLimit
       ?? createRateLimiter(CONFIG.rateLimitRps, CONFIG.rateBurst);
     this.throttled = 0; // จำนวนครั้งที่ RPC ส่ง Retry-After กลับมา
+    this.recovered = 0; // คำขอที่พลาดแล้วลองใหม่จนสำเร็จ (ไม่กระทบข้อมูล)
 
     this.nodes = urls.map((u) => {
       const node = {
@@ -358,18 +480,28 @@ class RpcPool {
     if (++n.consecFails >= CONFIG.breakerThreshold) {
       n.openUntil = Date.now() + CONFIG.breakerCooldownMs;
       n.consecFails = 0;
-      jlog({ evt: 'breaker_open', host: n.host, cooldownMs: CONFIG.breakerCooldownMs });
+      // node ที่เลิกใช้ถาวรไปแล้ว ไม่ต้องประกาศว่าพักชั่วคราวซ้ำอีก
+      if (!n.disabled) {
+        logRpcEvent('paused', {
+          evt: 'breaker_open', host: n.host,
+          text: `พักเซิร์ฟเวอร์นี้ ${CONFIG.breakerCooldownMs / 1000} วินาที เพราะล้มเหลวติดกัน ${CONFIG.breakerThreshold} ครั้ง`,
+          extra: { cooldownMs: CONFIG.breakerCooldownMs },
+        });
+      }
     }
   }
 
   /** ปิด endpoint ถาวรสำหรับรอบนี้ — ใช้กับ error ที่ retry ไปก็ไม่มีทางหาย */
-  disable(n, reason) {
+  disable(n, reason, why) {
     if (n.disabled) return;
     n.disabled = true;
     n.disabledReason = reason;
-    jlog({
-      evt: 'endpoint_disabled', host: n.host, reason,
-      remaining: this.usable().length,
+    const left = this.usable().length;
+    logRpcEvent('disabled', {
+      evt: 'endpoint_disabled', host: n.host, status: Number(reason) || 0,
+      text: `เลิกใช้เซิร์ฟเวอร์นี้ทั้งรอบ — ${why}`,
+      detail: `(เหลือใช้ได้ ${left} เซิร์ฟเวอร์)`,
+      extra: { reason, remaining: left },
     });
   }
 
@@ -396,6 +528,7 @@ class RpcPool {
         const res = await fn(n.conn);
         n.totalMs += Date.now() - t0;
         this.ok(n);
+        if (tried.size) this.recovered++; // พลาดมาก่อน แต่จบด้วยความสำเร็จ
         return res;
       } catch (e) {
         n.totalMs += Date.now() - t0;
@@ -406,28 +539,36 @@ class RpcPool {
         const kind = classifyError(e);
         const retryAfter = Math.max(0, n.retryAfterUntil - Date.now());
         n.retryAfterUntil = 0; // ใช้ครั้งเดียว
-        jlog({
-          evt: 'rpc_retry', label, host: n.host,
-          attempt: attempt + 1, ms: Date.now() - t0, kind,
-          status: httpStatusOf(e) || undefined,
-          retryAfterMs: retryAfter || undefined,
-          msg: (e?.message || '').slice(0, 160),
-        });
+        const status = httpStatusOf(e);
+        const why = explainStatus(status, e?.message);
 
         if (kind === 'permanent') {
           // endpoint นี้ใช้ไม่ได้เลย — ปิดทิ้งแล้วไปตัวถัดไปทันที
           // ไม่นับเป็น retry เพราะไม่ใช่ความผิดของ request
-          this.disable(n, `${httpStatusOf(e) || 'error'}`);
+          this.disable(n, `${status || 'error'}`, why);
           continue;
         }
 
         attempt++;
-        if (attempt < CONFIG.maxRetries) {
+        const last = attempt >= CONFIG.maxRetries;
+        let wait = 0;
+        if (!last) {
           const base = kind === 'ratelimit' ? 2000 : 500;
           const backoff = Math.min(15000, base * 2 ** (attempt - 1)) * (0.7 + Math.random() * 0.6);
           // ถ้า server บอก Retry-After มา ให้เชื่อ server ก่อนการเดาของเรา
-          await delay(Math.min(30000, Math.max(backoff, retryAfter)));
+          wait = Math.min(30000, Math.max(backoff, retryAfter));
         }
+
+        logRpcEvent(kind === 'ratelimit' ? 'ratelimit' : 'retry', {
+          evt: 'rpc_retry', host: n.host, status, msg: e?.message,
+          text: why,
+          detail: last
+            ? `· ครบ ${CONFIG.maxRetries} ครั้งแล้ว ยอมแพ้ (${label})`
+            : `· รอ ${(wait / 1000).toFixed(1)} วิ แล้วลองใหม่ (ครั้งที่ ${attempt}/${CONFIG.maxRetries})`,
+          extra: { label, attempt, ms: Date.now() - t0, kind, retryAfterMs: retryAfter || undefined },
+        });
+
+        if (!last) await delay(wait);
       } finally {
         n.inflight--;
       }
@@ -486,7 +627,13 @@ async function resolveMints(pool, mints) {
       });
     } catch (e) {
       failed += batch.length;
-      jlog({ evt: 'resolve_mints_failed', batch: bi, msg: (e?.message || '').slice(0, 160) });
+      logRpcEvent('failed', {
+        evt: 'resolve_mints_failed', host: `mint ชุดที่ ${bi + 1}`,
+        status: httpStatusOf(e), msg: e?.message,
+        text: `อ่านข้อมูลเหรียญไม่สำเร็จ — ${explainStatus(httpStatusOf(e), e?.message)}`,
+        detail: `· ${batch.length} เหรียญในชุดนี้จะไม่ถูกตรวจ`,
+        extra: { batch: bi },
+      });
     }
   })));
 
@@ -538,9 +685,12 @@ async function scanWalletByAta(pool, wallet, mintInfoMap) {
       // เก็บผลของ batch อื่นไว้ แล้วไปต่อ — รายงานเป็น partial ทีหลัง
       failedBatches++;
       lastError = e;
-      jlog({
-        evt: 'batch_failed', wallet: wallet.name, batch: totalBatches,
-        size: batch.length, msg: (e?.message || '').slice(0, 160),
+      logRpcEvent('failed', {
+        evt: 'batch_failed', host: wallet.name,
+        status: httpStatusOf(e), msg: e?.message,
+        text: `ตรวจเหรียญชุดที่ ${totalBatches} ไม่สำเร็จ — ${explainStatus(httpStatusOf(e), e?.message)}`,
+        detail: `· ขาดไป ${batch.length} เหรียญ`,
+        extra: { wallet: wallet.name, batch: totalBatches, size: batch.length },
       });
       continue;
     }
@@ -588,9 +738,12 @@ async function scanWalletFull(pool, wallet, mintInfoMap) {
       // program หนึ่งพัง ไม่ควรทิ้งผลของอีก program — เหมือน batch ใน ATA mode
       failedBatches++;
       lastError = e;
-      jlog({
-        evt: 'batch_failed', wallet: wallet.name, mode: 'full',
-        program: programId.toBase58(), msg: (e?.message || '').slice(0, 160),
+      logRpcEvent('failed', {
+        evt: 'batch_failed', host: wallet.name,
+        status: httpStatusOf(e), msg: e?.message,
+        text: `อ่านบัญชีของ ${programId.equals(TOKEN_PROGRAM_ID) ? 'SPL' : 'Token-2022'} ไม่สำเร็จ — ` +
+          `${explainStatus(httpStatusOf(e), e?.message)}`,
+        extra: { wallet: wallet.name, mode: 'full', program: programId.toBase58() },
       });
       continue;
     }
@@ -786,7 +939,9 @@ async function main() {
   // SCAN
   // ============================================================
   const mode = CONFIG.fullScan ? 'FULL (getTokenAccountsByOwner)' : 'ATA (getMultipleAccounts)';
-  console.log(`\n${c.cyan}${c.bright}>> เริ่มสแกน ${wallets.length} wallet — โหมด: ${mode}${c.reset}\n`);
+  console.log(`\n${c.cyan}${c.bright}>> เริ่มสแกน ${wallets.length} กระเป๋า — โหมด: ${mode}${c.reset}`);
+  printLegend();
+  console.log('');
 
   const limit = createLimiter(CONFIG.concurrency);
   const rowsToAdd = [];
@@ -920,13 +1075,25 @@ async function main() {
   console.log(`${c.magenta}Token-2022 holdings พบ: ${t2022Rows}${c.reset}`);
   console.log(`${c.green}Records: ${rowsToAdd.length}${c.reset}`);
 
-  console.log(`${c.gray}— RPC stats — (rate limit ${CONFIG.rateLimitRps} req/s, throttled ${pool.throttled} ครั้ง)${c.reset}`);
+  console.log(`\n${c.bright}เซิร์ฟเวอร์ที่ใช้${c.reset} ` +
+    `${c.dim}(จำกัด ${CONFIG.rateLimitRps} คำขอ/วินาที · ถูกขอให้ชะลอ ${pool.throttled} ครั้ง)${c.reset}`);
+  console.log(`  ${c.dim}${'เซิร์ฟเวอร์'.padEnd(36)}${'คำขอ'.padStart(7)}${'พลาด'.padStart(8)}${'ตอบเฉลี่ย'.padStart(11)}${c.reset}`);
   for (const s of pool.stats()) {
-    const rate = s.calls ? ((s.errors / s.calls) * 100).toFixed(0) : '0';
-    const flag = s.disabled ? `${c.red} [DISABLED:${s.disabledReason}]${c.reset}` : '';
-    console.log(`${c.gray}  ${s.host.padEnd(42)} calls=${String(s.calls).padStart(5)} ` +
-      `errors=${String(s.errors).padStart(4)} (${rate.padStart(3)}%) avg=${s.avgMs}ms${c.reset}${flag}`);
+    const pct = s.calls ? Math.round((s.errors / s.calls) * 100) : 0;
+    const tone = s.disabled ? c.red : pct >= 20 ? c.yellow : c.green;
+    const flag = s.disabled ? ` ${c.red}⏭ เลิกใช้ (รหัส ${s.disabledReason})${c.reset}` : '';
+    console.log(
+      `  ${c.gray}${s.host.padEnd(36)}${c.reset}` +
+      `${String(s.calls).padStart(7)}` +
+      `${tone}${`${s.errors} (${pct}%)`.padStart(8)}${c.reset}` +
+      `${`${s.avgMs}ms`.padStart(11)}${flag}`
+    );
   }
+  if (pool.recovered) {
+    console.log(`  ${c.green}✓${c.reset} ${c.dim}${pool.recovered} คำขอที่พลาดถูกลองใหม่จนสำเร็จ — ไม่กระทบข้อมูล${c.reset}`);
+  }
+
+  printTally();
 
   // แยก Warnings ออกจาก Errors — partial คือ "ข้อมูลไม่ครบ" ไม่ใช่ "งานล้มเหลว"
   // การเอาไปกองรวมกันทำให้ summary ดูเหมือนพังทั้งที่ job ผ่าน
@@ -965,4 +1132,5 @@ export {
   RpcPool, classifyError, httpStatusOf, CONFIG,
   computeCoverage, scanWalletByAta,
   createRateLimiter, parseRetryAfter,
+  explainStatus, printTally, printLegend, USE_COLOR,
 };
