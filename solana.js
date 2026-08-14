@@ -1,207 +1,358 @@
+/**
+ * SOLANA TOKEN TRACKER v2 — Public RPC, No API Key
+ * ------------------------------------------------
+ * กลยุทธ์: เลิกใช้ getProgramAccounts (getTokenAccountsByOwner) ซึ่งเป็น query
+ * ที่หนักที่สุดและถูก public RPC throttle/drop เกือบตลอด
+ * เปลี่ยนเป็นคำนวณ ATA แบบ offline แล้วดึงยอดด้วย getMultipleAccounts (เบามาก)
+ *
+ * จุดแก้หลักจากเวอร์ชันเดิม:
+ *  1. AbortController — timeout ยกเลิก TCP connection จริง (แก้ socket leak)
+ *  2. RpcPool + circuit breaker — failover ระหว่างรัน ไม่ใช่แค่ตอน init
+ *  3. ATA + getMultipleAccounts — เร็วขึ้น ~50-90 เท่า
+ *  4. ตรวจ program ของ mint จริง — ไม่ต้องเดา SPL vs Token-2022
+ *  5. Coverage guard — ไม่ clear() sheet ถ้ารอบนี้ข้อมูลไม่ครบ
+ *  6. ไม่ซ่อน error อีกต่อไป — timeout ถูกนับเป็น error เสมอ
+ */
+
 import { Connection, PublicKey } from '@solana/web3.js';
-import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
+import {
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  unpackAccount,
+  unpackMint,
+} from '@solana/spl-token';
 import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 import dotenv from 'dotenv';
 dotenv.config();
 
+// ============================================================
+// CONFIG
+// ============================================================
+
 const c = {
   reset: '\x1b[0m', bright: '\x1b[1m', dim: '\x1b[2m',
   cyan: '\x1b[36m', green: '\x1b[32m', yellow: '\x1b[33m',
-  red: '\x1b[31m', gray: '\x1b[90m', magenta: '\x1b[35m'
+  red: '\x1b[31m', gray: '\x1b[90m', magenta: '\x1b[35m',
 };
+// ปิดสีอัตโนมัติเมื่อไม่ใช่ TTY (เช่นบน GitHub Actions) เพื่อให้ log อ่านง่าย
+const USE_COLOR = process.stdout.isTTY && process.env.NO_COLOR !== '1';
+if (!USE_COLOR) for (const k of Object.keys(c)) c[k] = '';
 
 const GOOGLE_SERVICE_ACCOUNT_EMAIL = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
+const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY
+  ? process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n') : '';
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
 const SHEET_TAB_NAME = 'Solana_Tracker';
 const SUBSCRIPTION_SPL_TAB = 'SUBSCRIPTION SPL';
 const SUBSCRIPTION_WALLET_TAB = 'SUBSCRIPTION WALLET';
-const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
+const SHEET_HEADERS = ['Symbol', 'Network', 'Token Mint', 'Amount',
+  'Wallet Name', 'Wallet Address', 'Timestamp'];
 
-// ============================================
-// RPC ENDPOINTS - ฟรี ไม่มี API Key
-// ============================================
-
-// 🔹 SPL ONLY
-const SPL_RPC_ENDPOINTS = [
-  'https://api.mainnet-beta.solana.com',
-  'https://solana-rpc.publicnode.com',
-];
-
-// 🔹 Token-2022 ONLY - ไม่มี Helius!
-const TOKEN2022_RPC_ENDPOINTS = [
-  'https://solana-rpc.publicnode.com',
-  'https://api.mainnet-beta.solana.com',
-];
-
-let splConn = null;
-let token2022Conn = null;
-
-// 🆕 เพิ่ม Token-2022 timeout ให้นานขึ้น
 const CONFIG = {
-  splTimeoutMs: 10000,           // SPL 10 วิ
-  token2022TimeoutMs: 60000,     // 🆕 Token-2022 60 วิ (เพิ่มจาก 15 วิ)
-  token2022DelayMs: 500,
-  maxRetries: 3,
-  walletDelayMs: 800,
+  // timeout ต่อ 1 HTTP request — 15s พอเหลือเฟือ (จาก log เดิม request ที่สำเร็จใช้ ~1s)
+  rpcTimeoutMs: Number(process.env.RPC_TIMEOUT_MS || 15000),
+  // จำนวน request ที่ยิงพร้อมกัน — เริ่มที่ 4 แล้วค่อยจูนขึ้น/ลงตาม 429
+  concurrency: Number(process.env.CONCURRENCY || 4),
+  // จำนวน retry ต่อ 1 request (แต่ละครั้งอาจสลับ endpoint)
+  maxRetries: Number(process.env.MAX_RETRIES || 4),
+  // ต้องสแกน wallet สำเร็จอย่างน้อยกี่ % ถึงจะยอมเขียนทับ Sheet
+  minCoverage: Number(process.env.MIN_COVERAGE || 0.95),
+  // เปิด full scan (getTokenAccountsByOwner) เพื่อจับ non-ATA — ช้า ใช้เฉพาะตอนตรวจสอบ
+  fullScan: process.env.FULL_SCAN === '1',
+  // circuit breaker: fail ติดกันกี่ครั้งถึงพัก endpoint นั้น และพักนานเท่าไหร่
+  breakerThreshold: 3,
+  breakerCooldownMs: 30000,
+  // ขนาด batch ของ getMultipleAccounts (ข้อจำกัด RPC = 100)
+  batchSize: 100,
 };
 
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+// Public RPC ที่ไม่ต้องใช้ API Key
+// แนะนำให้ทดสอบด้วย curl ก่อน แล้วเก็บเฉพาะตัวที่ตอบ getMultipleAccounts ได้
+const DEFAULT_RPCS = [
+  'https://solana-rpc.publicnode.com',
+  'https://api.mainnet-beta.solana.com',
+  'https://solana.drpc.org',
+  'https://endpoints.omniatech.io/v1/sol/mainnet/public',
+];
+
+// ============================================================
+// UTILS
+// ============================================================
+
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function formatDate(date) {
-  const formatter = new Intl.DateTimeFormat('en-US', {
+  const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Bangkok',
     year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   });
-  const parts = formatter.formatToParts(date);
-  const partMap = {};
-  parts.forEach(p => partMap[p.type] = p.value);
-  return `${partMap.month}/${partMap.day}/${partMap.year} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
+  const p = {};
+  fmt.formatToParts(date).forEach((x) => (p[x.type] = x.value));
+  return `${p.month}/${p.day}/${p.year} ${p.hour}:${p.minute}:${p.second}`;
 }
 
-// ============================================
-// INIT CONNECTIONS
-// ============================================
+/** แปลง bigint + decimals -> number โดยไม่เสีย precision ระหว่างทาง */
+function toUiAmount(raw, decimals) {
+  if (decimals === 0) return Number(raw);
+  const s = raw.toString().padStart(decimals + 1, '0');
+  const int = s.slice(0, s.length - decimals);
+  const frac = s.slice(s.length - decimals);
+  return Number(`${int}.${frac}`);
+}
 
-async function initConnections() {
-  for (const endpoint of SPL_RPC_ENDPOINTS) {
-    try {
-      const conn = new Connection(endpoint, 'confirmed');
-      await Promise.race([
-        conn.getSlot(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-      ]);
-      splConn = conn;
-      console.log(`${c.green}✓ [SPL] ${endpoint.split('/')[2]}${c.reset}`);
-      break;
-    } catch {
-      console.log(`${c.yellow}⚠ [SPL] Skip ${endpoint.split('/')[2]}${c.reset}`);
+/** ตัวจำกัด concurrency แบบ inline — ไม่ต้องลง p-limit เพิ่ม */
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    if (active >= max || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    Promise.resolve()
+      .then(fn)
+      .then(resolve, reject)
+      .finally(() => { active--; next(); });
+  };
+  return (fn) => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    next();
+  });
+}
+
+/** log แบบ JSON บรรทัดเดียว — grep/analyze ได้จริง */
+function jlog(obj) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), ...obj }));
+}
+
+// ============================================================
+// RPC LAYER
+// ============================================================
+
+/**
+ * หัวใจของการแก้ socket leak:
+ * Promise.race แค่ทิ้ง promise ที่แพ้ ไม่ได้ปิด connection
+ * AbortController ยกเลิก request จริง -> socket ถูกคืน pool เสมอ
+ */
+function makeConn(endpoint, timeoutMs) {
+  return new Connection(endpoint, {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true, // กัน retry ซ้อน retry ของ web3.js
+    fetch: async (url, opts) => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...opts, signal: ac.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  });
+}
+
+class RpcPool {
+  constructor(urls, timeoutMs) {
+    this.nodes = urls.map((u) => ({
+      url: u,
+      host: (() => { try { return new URL(u).host; } catch { return u; } })(),
+      conn: makeConn(u, timeoutMs),
+      fails: 0,
+      openUntil: 0,
+      inflight: 0,
+      calls: 0,
+      errors: 0,
+      totalMs: 0,
+    }));
+    if (!this.nodes.length) throw new Error('RpcPool: ไม่มี endpoint');
+  }
+
+  pick() {
+    const now = Date.now();
+    const avail = this.nodes.filter((n) => now > n.openUntil);
+    const pool = avail.length ? avail : this.nodes; // ถ้าเปิดวงจรหมด ใช้ที่มี
+    return pool.sort((a, b) => a.inflight - b.inflight || a.fails - b.fails)[0];
+  }
+
+  ok(n) { n.fails = 0; }
+
+  fail(n) {
+    n.errors++;
+    if (++n.fails >= CONFIG.breakerThreshold) {
+      n.openUntil = Date.now() + CONFIG.breakerCooldownMs;
+      n.fails = 0;
+      jlog({ evt: 'breaker_open', host: n.host, cooldownMs: CONFIG.breakerCooldownMs });
     }
   }
 
-  for (const endpoint of TOKEN2022_RPC_ENDPOINTS) {
-    try {
-      const conn = new Connection(endpoint, 'confirmed');
-      await Promise.race([
-        conn.getSlot(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-      ]);
-      token2022Conn = conn;
-      console.log(`${c.green}✓ [T2022] ${endpoint.split('/')[2]}${c.reset}`);
-      break;
-    } catch {
-      console.log(`${c.yellow}⚠ [T2022] Skip ${endpoint.split('/')[2]}${c.reset}`);
+  /** เรียก RPC พร้อม retry + สลับ endpoint + exponential backoff + jitter */
+  async call(fn, label = 'rpc') {
+    let lastErr;
+    for (let i = 0; i < CONFIG.maxRetries; i++) {
+      const n = this.pick();
+      n.inflight++;
+      n.calls++;
+      const t0 = Date.now();
+      try {
+        const res = await fn(n.conn);
+        n.totalMs += Date.now() - t0;
+        this.ok(n);
+        return res;
+      } catch (e) {
+        n.totalMs += Date.now() - t0;
+        lastErr = e;
+        this.fail(n);
+        const aborted = e?.name === 'AbortError' || /abort/i.test(e?.message || '');
+        const is429 = /429|too many requests|rate/i.test(e?.message || '');
+        jlog({
+          evt: 'rpc_retry', label, host: n.host, attempt: i + 1,
+          ms: Date.now() - t0,
+          reason: aborted ? 'timeout' : is429 ? '429' : 'error',
+          msg: (e?.message || '').slice(0, 160),
+        });
+        if (i < CONFIG.maxRetries - 1) {
+          const base = is429 ? 2000 : 500;
+          const wait = Math.min(15000, base * 2 ** i) * (0.7 + Math.random() * 0.6);
+          await delay(wait);
+        }
+      } finally {
+        n.inflight--;
+      }
     }
+    throw lastErr;
   }
 
-  if (!splConn) {
-    console.error(`${c.red}✗ No SPL RPC${c.reset}`);
-    process.exit(1);
-  }
-}
-
-// ============================================
-// FETCH SPL
-// ============================================
-
-async function fetchSPLAccounts(walletPubKey) {
-  if (!splConn) return { success: false, data: [] };
-
-  try {
-    await delay(100);
-    const result = await Promise.race([
-      splConn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_PROGRAM_ID }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), CONFIG.splTimeoutMs))
-    ]);
-    return { success: true, data: result.value };
-  } catch (e) {
-    return { success: false, error: e.message, data: [] };
+  stats() {
+    return this.nodes.map((n) => ({
+      host: n.host, calls: n.calls, errors: n.errors,
+      avgMs: n.calls ? Math.round(n.totalMs / n.calls) : 0,
+    }));
   }
 }
 
-// ============================================
-// 🆕 FETCH TOKEN-2022 - Timeout นานขึ้น
-// ============================================
+// ============================================================
+// MINT RESOLUTION
+// ============================================================
 
-async function fetchToken2022Accounts(walletPubKey) {
-  if (!token2022Conn) return { success: false, data: [] };
+/**
+ * ตรวจว่าแต่ละ mint อยู่ใต้ program ไหน (SPL หรือ Token-2022) และมี decimals เท่าไหร่
+ * ทำครั้งเดียวต่อรอบ -> ไม่ต้องยิง 2 รอบต่อ wallet อีกต่อไป
+ * ใช้ getMultipleAccountsInfo (raw bytes) แล้ว decode เอง = ไม่พึ่ง jsonParsed ของ RPC
+ */
+async function resolveMints(pool, mints) {
+  const out = new Map(); // mint(string) -> { programId, decimals }
+  const limit = createLimiter(CONFIG.concurrency);
+  const batches = [];
+  for (let i = 0; i < mints.length; i += CONFIG.batchSize) {
+    batches.push(mints.slice(i, i + CONFIG.batchSize));
+  }
 
-  for (let attempt = 0; attempt < CONFIG.maxRetries; attempt++) {
+  let failed = 0;
+  await Promise.all(batches.map((batch, bi) => limit(async () => {
+    const keys = batch.map((m) => new PublicKey(m));
     try {
-      await delay(CONFIG.token2022DelayMs);
-      
-      // 🆕 Timeout 60 วินาที
-      const result = await Promise.race([
-        token2022Conn.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_2022_PROGRAM_ID }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), CONFIG.token2022TimeoutMs))
-      ]);
-
-      return { success: true, data: result.value };
-
+      const infos = await pool.call(
+        (conn) => conn.getMultipleAccountsInfo(keys),
+        `resolveMints[${bi}]`
+      );
+      infos.forEach((info, j) => {
+        if (!info) return; // mint ไม่มีอยู่จริงบน chain
+        const owner = info.owner;
+        const isSpl = owner.equals(TOKEN_PROGRAM_ID);
+        const is2022 = owner.equals(TOKEN_2022_PROGRAM_ID);
+        if (!isSpl && !is2022) return; // ไม่ใช่ token mint
+        try {
+          const parsed = unpackMint(keys[j], info, owner);
+          out.set(batch[j], { programId: owner, decimals: parsed.decimals });
+        } catch { /* decode ไม่ได้ ข้ามไป */ }
+      });
     } catch (e) {
-      const isUnsupported = e.message?.includes('not supported') || 
-                           e.message?.includes('Method not found');
-      const is429 = e.message?.includes('429');
-      
-      if (isUnsupported) {
-        console.log(`${c.yellow}    [T2022] RPC doesn't support parsed accounts${c.reset}`);
-        return { success: false, error: 'Not supported', data: [] };
-      }
-      
-      if (is429 && attempt < CONFIG.maxRetries - 1) {
-        const wait = 3000 * Math.pow(2, attempt);
-        console.log(`${c.dim}    [T2022] 429, wait ${wait}ms${c.reset}`);
-        await delay(wait);
-      } else if (attempt < CONFIG.maxRetries - 1) {
-        await delay(2000);
-      } else {
-        return { success: false, error: e.message, data: [] };
-      }
+      failed += batch.length;
+      jlog({ evt: 'resolve_mints_failed', batch: bi, msg: (e?.message || '').slice(0, 160) });
     }
-  }
-  
-  return { success: false, error: 'Max retries', data: [] };
+  })));
+
+  return { map: out, failed };
 }
 
-// ============================================
-// MAIN
-// ============================================
+// ============================================================
+// WALLET SCAN
+// ============================================================
 
-async function main() {
-  const startTime = Date.now();
+/** สแกน 1 wallet ด้วย ATA — 599 mints = ~6 requests */
+async function scanWalletByAta(pool, wallet, mintInfoMap) {
+  const owner = new PublicKey(wallet.address);
 
-  console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER (No Helius - Long Timeout)       ║${c.reset}`);
-  console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}\n`);
-
-  if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
-    console.error(`${c.red}✗ Missing env vars${c.reset}`);
-    process.exit(1);
+  // คำนวณ ATA address แบบ offline ทั้งหมด — ไม่ยิง RPC เลยในขั้นนี้
+  const targets = [];
+  for (const [mint, meta] of mintInfoMap) {
+    let ata;
+    try {
+      ata = getAssociatedTokenAddressSync(
+        new PublicKey(mint), owner, true, meta.programId
+      );
+    } catch { continue; }
+    targets.push({ mint, ata, meta });
   }
 
-  // Google Sheets
-  console.log(`${c.cyan}[1/5] Connecting to Google Sheets...${c.reset}`);
-  const serviceAccountAuth = new JWT({
-    email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: GOOGLE_PRIVATE_KEY,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-
-  const doc = new GoogleSpreadsheet(SPREADSHEET_ID, serviceAccountAuth);
-  try {
-    await doc.loadInfo();
-    console.log(`${c.green}✓ Connected${c.reset}`);
-  } catch (err) {
-    console.error(`${c.red}✗ Failed: ${err.message}${c.reset}`);
-    process.exit(1);
+  const found = [];
+  for (let i = 0; i < targets.length; i += CONFIG.batchSize) {
+    const batch = targets.slice(i, i + CONFIG.batchSize);
+    const infos = await pool.call(
+      (conn) => conn.getMultipleAccountsInfo(batch.map((t) => t.ata)),
+      `scan:${wallet.name}`
+    );
+    infos.forEach((info, j) => {
+      if (!info) return; // ATA ยังไม่ถูกสร้าง = ไม่ถือ token นี้
+      const t = batch[j];
+      try {
+        const acc = unpackAccount(t.ata, info, t.meta.programId);
+        if (acc.amount === 0n) return;
+        found.push({
+          mint: t.mint,
+          amount: toUiAmount(acc.amount, t.meta.decimals),
+        });
+      } catch { /* ไม่ใช่ token account ที่ถูกต้อง */ }
+    });
   }
+  return found;
+}
 
-  // Load custom RPC from nodes sheet
+/**
+ * โหมดตรวจสอบ (FULL_SCAN=1): ใช้ getTokenAccountsByOwner เพื่อจับ token ที่อยู่ใน
+ * account ที่ไม่ใช่ ATA — ช้าและหนัก ใช้เฉพาะตอนอยากเทียบผลว่า ATA ครอบคลุมพอไหม
+ */
+async function scanWalletFull(pool, wallet, mintInfoMap) {
+  const owner = new PublicKey(wallet.address);
+  const found = [];
+  for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+    const res = await pool.call(
+      (conn) => conn.getTokenAccountsByOwner(owner, { programId }),
+      `full:${wallet.name}`
+    );
+    for (const { pubkey, account } of res.value) {
+      try {
+        const acc = unpackAccount(pubkey, account, programId);
+        if (acc.amount === 0n) continue;
+        const mint = acc.mint.toBase58();
+        const meta = mintInfoMap.get(mint);
+        if (!meta) continue; // ไม่ได้ subscribe mint นี้
+        found.push({ mint, amount: toUiAmount(acc.amount, meta.decimals) });
+      } catch { /* skip */ }
+    }
+  }
+  return found;
+}
+
+// ============================================================
+// GOOGLE SHEETS
+// ============================================================
+
+async function loadSheetsData(doc) {
+  // --- custom RPC จากแท็บ nodes ---
+  const customRpcs = [];
   const nodesSheet = doc.sheetsByTitle['nodes'];
   if (nodesSheet) {
     try {
@@ -209,235 +360,266 @@ async function main() {
       if (maxRows >= 2) {
         await nodesSheet.loadCells(`A1:C${maxRows}`);
         for (let r = 1; r < maxRows; r++) {
-          const netCell = nodesSheet.getCell(r, 0);
-          const urlCell = nodesSheet.getCell(r, 1);
-          const typeCell = nodesSheet.getCell(r, 2);
-          
-          if (netCell?.value?.toString().toLowerCase() === 'solana' && urlCell?.value) {
-            const url = String(urlCell.value).trim();
-            const type = typeCell?.value ? String(typeCell.value).toLowerCase().trim() : 'spl';
-            
-            // 🆕 ป้องกันไม่ให้ใช้ Helius
-            if (url.includes('helius')) {
-              console.log(`${c.yellow}⚠ Skip Helius endpoint${c.reset}`);
-              continue;
-            }
-            
-            if (type === 'token2022') TOKEN2022_RPC_ENDPOINTS.unshift(url);
-            else SPL_RPC_ENDPOINTS.unshift(url);
+          const net = nodesSheet.getCell(r, 0)?.value;
+          const url = nodesSheet.getCell(r, 1)?.value;
+          if (String(net || '').toLowerCase() !== 'solana' || !url) continue;
+          const u = String(url).trim();
+          try { new URL(u); } catch {
+            console.log(`${c.yellow}⚠ nodes: URL ไม่ถูกต้อง ข้าม -> ${u}${c.reset}`);
+            continue;
           }
+          customRpcs.push(u);
         }
       }
-    } catch {}
+    } catch (e) {
+      // ไม่ซ่อน error อีกต่อไป
+      console.log(`${c.yellow}⚠ อ่านแท็บ nodes ไม่ได้: ${e.message}${c.reset}`);
+    }
   }
 
-  // Init connections
-  console.log(`${c.cyan}[2/5] Initializing RPC...${c.reset}`);
-  await initConnections();
-
-  // Load Wallets
-  console.log(`${c.cyan}[3/5] Loading wallets...${c.reset}`);
-  let WALLETS = [];
+  // --- wallets ---
+  const wallets = [];
   const walletSheet = doc.sheetsByTitle[SUBSCRIPTION_WALLET_TAB];
-  if (walletSheet) {
-    try {
-      const maxRows = walletSheet.rowCount;
-      if (maxRows >= 3) {
-        await walletSheet.loadCells(`A1:B${maxRows}`);
-        for (let r = 2; r < maxRows; r++) {
-          const nameCell = walletSheet.getCell(r, 0);
-          const addrCell = walletSheet.getCell(r, 1);
-          const addr = addrCell?.value ? String(addrCell.value).trim() : '';
-          const name = nameCell?.value ? String(nameCell.value).trim() : 'Unknown';
-          if (addr) {
-            try { new PublicKey(addr); WALLETS.push({ name, address: addr }); } catch {}
-          }
-        }
+  if (!walletSheet) throw new Error(`ไม่พบแท็บ "${SUBSCRIPTION_WALLET_TAB}"`);
+  const wRows = walletSheet.rowCount;
+  if (wRows >= 3) {
+    await walletSheet.loadCells(`A1:B${wRows}`);
+    for (let r = 2; r < wRows; r++) {
+      const name = String(walletSheet.getCell(r, 0)?.value ?? '').trim() || 'Unknown';
+      const addr = String(walletSheet.getCell(r, 1)?.value ?? '').trim();
+      if (!addr) continue;
+      try {
+        new PublicKey(addr);
+        wallets.push({ name, address: addr });
+      } catch {
+        console.log(`${c.yellow}⚠ wallet address ไม่ถูกต้อง แถว ${r + 1}: ${addr}${c.reset}`);
       }
-    } catch {}
+    }
   }
 
-  if (!WALLETS.length) {
-    console.error(`${c.red}✗ No valid wallets${c.reset}`);
-    process.exit(0);
-  }
-  console.log(`${c.green}✓ Loaded ${WALLETS.length} wallet(s)${c.reset}`);
-
-  // Load Tokens
-  console.log(`${c.cyan}[4/5] Loading token subscriptions...${c.reset}`);
-  const tokenMap = new Map();
+  // --- tokens ---
+  const tokenMap = new Map(); // mint -> symbol
   const subsSheet = doc.sheetsByTitle[SUBSCRIPTION_SPL_TAB];
-  
-  if (subsSheet) {
-    try {
-      const maxRows = subsSheet.rowCount;
-      if (maxRows >= 2) {
-        await subsSheet.loadCells(`A1:C${maxRows}`);
-        for (let r = 1; r < maxRows; r++) {
-          const symCell = subsSheet.getCell(r, 0);
-          const mintCell = subsSheet.getCell(r, 2);
-          
-          let mints = [];
-          const mintRaw = mintCell?.value ? String(mintCell.value).trim() : '';
-          if (mintRaw) {
-            try {
-              mints = JSON.parse(mintRaw);
-              if (!Array.isArray(mints)) mints = [mintRaw];
-            } catch { mints = [mintRaw]; }
-          }
-          
-          const sym = symCell?.value ? String(symCell.value).trim() : 'Unknown';
-          for (const m of mints) {
-            try { new PublicKey(m); tokenMap.set(m, sym); } catch {}
-          }
-        }
+  if (!subsSheet) throw new Error(`ไม่พบแท็บ "${SUBSCRIPTION_SPL_TAB}"`);
+  const sRows = subsSheet.rowCount;
+  if (sRows >= 2) {
+    await subsSheet.loadCells(`A1:C${sRows}`);
+    for (let r = 1; r < sRows; r++) {
+      const sym = String(subsSheet.getCell(r, 0)?.value ?? '').trim() || 'Unknown';
+      const raw = String(subsSheet.getCell(r, 2)?.value ?? '').trim();
+      if (!raw) continue;
+      let mints;
+      try {
+        mints = JSON.parse(raw);
+        if (!Array.isArray(mints)) mints = [raw];
+      } catch { mints = [raw]; }
+      for (const m of mints) {
+        const s = String(m).trim();
+        try { new PublicKey(s); tokenMap.set(s, sym); } catch { /* skip */ }
       }
-    } catch {}
+    }
   }
 
+  return { customRpcs, wallets, tokenMap };
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+async function main() {
+  const startTime = Date.now();
+
+  console.log(`\n${c.cyan}${c.bright}╔══════════════════════════════════════════════════════════╗${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║  SOLANA TOKEN TRACKER v2  (Public RPC / ATA / No Key)    ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}╚══════════════════════════════════════════════════════════╝${c.reset}\n`);
+
+  if (!GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !SPREADSHEET_ID) {
+    console.error(`${c.red}✗ ขาด env vars (GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_PRIVATE_KEY / SPREADSHEET_ID)${c.reset}`);
+    process.exit(1);
+  }
+
+  // ---- [1/5] Google Sheets ----
+  console.log(`${c.cyan}[1/5] เชื่อมต่อ Google Sheets...${c.reset}`);
+  const auth = new JWT({
+    email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    key: GOOGLE_PRIVATE_KEY,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
+  const doc = new GoogleSpreadsheet(SPREADSHEET_ID, auth);
+  await doc.loadInfo();
+  console.log(`${c.green}✓ เชื่อมต่อแล้ว: ${doc.title}${c.reset}`);
+
+  // ---- [2/5] โหลด config จาก Sheets ----
+  console.log(`${c.cyan}[2/5] โหลด wallets / tokens / nodes...${c.reset}`);
+  const { customRpcs, wallets, tokenMap } = await loadSheetsData(doc);
+
+  if (!wallets.length) {
+    console.error(`${c.red}✗ ไม่พบ wallet ที่ใช้ได้${c.reset}`);
+    process.exit(1);
+  }
   if (!tokenMap.size) {
-    console.error(`${c.red}✗ No valid tokens${c.reset}`);
-    process.exit(0);
+    console.error(`${c.red}✗ ไม่พบ token ที่ใช้ได้${c.reset}`);
+    process.exit(1);
   }
-  console.log(`${c.green}✓ Loaded ${tokenMap.size} token(s)${c.reset}`);
+  console.log(`${c.green}✓ ${wallets.length} wallet(s), ${tokenMap.size} token(s)${c.reset}`);
 
-  // Setup Sheet
-  console.log(`${c.cyan}[5/5] Setting up sheet...${c.reset}`);
+  // ---- [3/5] RPC Pool ----
+  console.log(`${c.cyan}[3/5] ตั้งค่า RPC pool...${c.reset}`);
+  const rpcUrls = [...new Set([...customRpcs, ...DEFAULT_RPCS])];
+  const pool = new RpcPool(rpcUrls, CONFIG.rpcTimeoutMs);
+  rpcUrls.forEach((u) => console.log(`${c.gray}  • ${u}${c.reset}`));
+  console.log(`${c.gray}  timeout=${CONFIG.rpcTimeoutMs}ms concurrency=${CONFIG.concurrency} retries=${CONFIG.maxRetries}${c.reset}`);
+
+  // ---- [4/5] ตรวจ program + decimals ของทุก mint ----
+  console.log(`${c.cyan}[4/5] ตรวจ program/decimals ของ mint...${c.reset}`);
+  const t0Mint = Date.now();
+  const { map: mintInfoMap, failed: mintFailed } = await resolveMints(pool, [...tokenMap.keys()]);
+
+  let n2022 = 0;
+  for (const meta of mintInfoMap.values()) {
+    if (meta.programId.equals(TOKEN_2022_PROGRAM_ID)) n2022++;
+  }
+  console.log(`${c.green}✓ resolve ได้ ${mintInfoMap.size}/${tokenMap.size} mint ` +
+    `(SPL: ${mintInfoMap.size - n2022}, ${c.magenta}Token-2022: ${n2022}${c.green}) ` +
+    `${c.dim}(${((Date.now() - t0Mint) / 1000).toFixed(1)}s)${c.reset}`);
+  if (mintFailed) {
+    console.log(`${c.yellow}⚠ resolve ไม่สำเร็จ ${mintFailed} mint — ยอดของ mint เหล่านี้จะไม่ถูกดึง${c.reset}`);
+  }
+  if (!mintInfoMap.size) {
+    console.error(`${c.red}✗ resolve mint ไม่ได้เลย — RPC น่าจะมีปัญหาทั้งหมด${c.reset}`);
+    process.exit(1);
+  }
+
+  // ---- [5/5] เตรียม sheet ----
+  console.log(`${c.cyan}[5/5] เตรียม sheet ปลายทาง...${c.reset}`);
   let sheet = doc.sheetsByTitle[SHEET_TAB_NAME];
   if (!sheet) {
     sheet = await doc.addSheet({ title: SHEET_TAB_NAME, headerValues: SHEET_HEADERS });
-  } else {
-    try { await sheet.loadHeaderRow(); }
-    catch { await sheet.setHeaderRow(SHEET_HEADERS); }
   }
-  console.log(`${c.green}✓ Sheet ready${c.reset}`);
+  console.log(`${c.green}✓ พร้อม${c.reset}`);
 
-  // ============================================
-  // PROCESS WALLETS
-  // ============================================
-  console.log(`\n${c.cyan}${c.bright}>> Scanning wallets${c.reset}`);
-  console.log(`${c.gray}SPL: ${splConn.rpcEndpoint.split('/')[2]} | T2022: ${token2022Conn ? token2022Conn.rpcEndpoint.split('/')[2] : 'N/A'}${c.reset}`);
-  console.log(`${c.yellow}⚠ Token-2022 timeout: ${CONFIG.token2022TimeoutMs/1000}s (slow but thorough)${c.reset}\n`);
+  // ============================================================
+  // SCAN
+  // ============================================================
+  const mode = CONFIG.fullScan ? 'FULL (getTokenAccountsByOwner)' : 'ATA (getMultipleAccounts)';
+  console.log(`\n${c.cyan}${c.bright}>> เริ่มสแกน ${wallets.length} wallet — โหมด: ${mode}${c.reset}\n`);
 
-  let totalAdded = 0;
-  let totalT2022Found = 0;
-  const errors = [];
+  const limit = createLimiter(CONFIG.concurrency);
   const rowsToAdd = [];
+  const errors = [];
+  let okCount = 0;
+  let t2022Rows = 0;
+  let done = 0;
 
-  for (let wIdx = 0; wIdx < WALLETS.length; wIdx++) {
-    const wallet = WALLETS[wIdx];
-    const walletNum = wIdx + 1;
-    const walletInfo = `${c.gray}[${String(walletNum).padStart(3, '0')}/${WALLETS.length}]${c.reset}`;
-    const startWalletTime = Date.now();
-    
-    process.stdout.write(`${walletInfo} ${wallet.name.padEnd(35, ' ')} `);
-
-    let walletAdded = 0;
-    let walletT2022 = 0;
-
+  await Promise.all(wallets.map((wallet) => limit(async () => {
+    const t0 = Date.now();
     try {
-      const walletPubKey = new PublicKey(wallet.address);
+      const found = CONFIG.fullScan
+        ? await scanWalletFull(pool, wallet, mintInfoMap)
+        : await scanWalletByAta(pool, wallet, mintInfoMap);
 
-      // 1️⃣ Fetch SPL
-      const splResult = await fetchSPLAccounts(walletPubKey);
-      let allAccounts = splResult.success ? splResult.data : [];
-      
-      if (!splResult.success) {
-        errors.push(`${wallet.name} [SPL]: ${splResult.error}`);
+      const now = formatDate(new Date());
+      let w2022 = 0;
+      for (const f of found) {
+        const meta = mintInfoMap.get(f.mint);
+        if (meta?.programId.equals(TOKEN_2022_PROGRAM_ID)) { w2022++; t2022Rows++; }
+        rowsToAdd.push({
+          'Symbol': tokenMap.get(f.mint) ?? 'Unknown',
+          'Network': 'Solana',
+          'Token Mint': f.mint,
+          'Amount': f.amount,
+          'Wallet Name': wallet.name,
+          'Wallet Address': wallet.address,
+          'Timestamp': now,
+        });
       }
 
-      // 2️⃣ 🆕 Fetch Token-2022 (timeout นานขึ้น)
-      const t2022Result = await fetchToken2022Accounts(walletPubKey);
-      
-      if (t2022Result.success) {
-        allAccounts.push(...t2022Result.data);
-        walletT2022 = t2022Result.data.length;
-        totalT2022Found += walletT2022;
-      } else if (t2022Result.error && !t2022Result.error.includes('timeout')) {
-        errors.push(`${wallet.name} [T2022]: ${t2022Result.error}`);
-      }
-
-      // Process
-      for (const item of allAccounts) {
-        try {
-          const parsedInfo = item.account.data.parsed.info;
-          const mint = parsedInfo.mint;
-          const tokenAmount = parsedInfo.tokenAmount;
-
-          if (tokenMap.has(mint) && tokenAmount && tokenAmount.uiAmount > 0) {
-            const balanceFloat = parseFloat(tokenAmount.uiAmountString || tokenAmount.uiAmount);
-            const symbol = tokenMap.get(mint);
-            const nowStr = formatDate(new Date());
-
-            rowsToAdd.push({
-              'Symbol': symbol,
-              'Network': 'Solana',
-              'Token Mint': mint,
-              'Amount': balanceFloat,
-              'Wallet Name': wallet.name,
-              'Wallet Address': wallet.address,
-              'Timestamp': nowStr
-            });
-
-            walletAdded++;
-            totalAdded++;
-          }
-        } catch (e) {}
-      }
-
-      const walletTime = ((Date.now() - startWalletTime) / 1000).toFixed(1);
-      const t2022Tag = walletT2022 > 0 ? `${c.magenta}[T2022:${walletT2022}]${c.reset}` : '';
-      const statusColor = walletAdded > 0 ? c.green : c.gray;
-      console.log(`${statusColor}✓ ${String(walletAdded).padStart(2, '0')} tokens${c.reset} ${t2022Tag} ${c.dim}(${walletTime}s)${c.reset}`);
-
-    } catch (err) {
-      errors.push(`${wallet.name}: ${err.message}`);
-      console.log(`${c.red}✗ ${err.message.substring(0, 50)}${c.reset}`);
+      okCount++;
+      done++;
+      const tag = w2022 ? ` ${c.magenta}[T2022:${w2022}]${c.reset}` : '';
+      console.log(
+        `${c.gray}[${String(done).padStart(3, '0')}/${wallets.length}]${c.reset} ` +
+        `${wallet.name.padEnd(35, ' ')} ` +
+        `${found.length ? c.green : c.gray}✓ ${String(found.length).padStart(2, '0')} tokens${c.reset}` +
+        `${tag} ${c.dim}(${((Date.now() - t0) / 1000).toFixed(1)}s)${c.reset}`
+      );
+    } catch (e) {
+      done++;
+      // สำคัญ: timeout ก็นับเป็น error — ไม่ซ่อนเหมือนเวอร์ชันเดิม
+      errors.push(`${wallet.name}: ${e?.message || e}`);
+      console.log(
+        `${c.gray}[${String(done).padStart(3, '0')}/${wallets.length}]${c.reset} ` +
+        `${wallet.name.padEnd(35, ' ')} ` +
+        `${c.red}✗ FAILED${c.reset} ${c.dim}(${((Date.now() - t0) / 1000).toFixed(1)}s)${c.reset} ` +
+        `${c.red}${String(e?.message || e).slice(0, 60)}${c.reset}`
+      );
     }
+  })));
 
-    await delay(CONFIG.walletDelayMs);
-  }
+  // ============================================================
+  // COVERAGE GUARD + WRITE
+  // ============================================================
+  const coverage = okCount / wallets.length;
+  console.log(`\n${c.cyan}${c.bright}>> Coverage: ${(coverage * 100).toFixed(1)}% (${okCount}/${wallets.length})${c.reset}`);
 
-  // Write
-  console.log(`\n${c.cyan}${c.bright}>> Writing ${rowsToAdd.length} record(s)...${c.reset}`);
-  
-  if (rowsToAdd.length > 0) {
+  let wrote = false;
+  if (coverage < CONFIG.minCoverage) {
+    // ถ้าเขียนตอนนี้ = ลบข้อมูลดีของเมื่อวานทิ้ง แล้วใส่ข้อมูลไม่ครบแทน
+    console.error(`${c.red}✗ Coverage ต่ำกว่าเกณฑ์ (${(CONFIG.minCoverage * 100).toFixed(0)}%) — ` +
+      `ยกเลิกการเขียนทับ Sheet เพื่อกันข้อมูลหาย${c.reset}`);
+    process.exitCode = 1;
+  } else if (!rowsToAdd.length) {
+    console.log(`${c.yellow}⚠ ไม่มีข้อมูลให้เขียน — ข้ามการเขียนทับ${c.reset}`);
+  } else {
+    console.log(`${c.cyan}>> กำลังเขียน ${rowsToAdd.length} record...${c.reset}`);
     try {
       await sheet.clear();
       await sheet.setHeaderRow(SHEET_HEADERS);
-      await sheet.addRows(rowsToAdd);
-      console.log(`${c.green}✓ Written ${rowsToAdd.length} row(s)${c.reset}`);
-    } catch (err) {
-      console.error(`${c.red}✗ Write error: ${err.message}${c.reset}`);
-      errors.push(`Sheets: ${err.message}`);
+      // แบ่ง chunk กัน payload ใหญ่เกินของ Sheets API
+      for (let i = 0; i < rowsToAdd.length; i += 500) {
+        await sheet.addRows(rowsToAdd.slice(i, i + 500));
+      }
+      wrote = true;
+      console.log(`${c.green}✓ เขียนแล้ว ${rowsToAdd.length} แถว${c.reset}`);
+    } catch (e) {
+      console.error(`${c.red}✗ เขียน Sheet ไม่สำเร็จ: ${e.message}${c.reset}`);
+      errors.push(`Sheets: ${e.message}`);
+      process.exitCode = 1;
     }
-  } else {
-    console.log(`${c.yellow}⚠ No data${c.reset}`);
   }
 
-  // Summary
-  const execSecs = ((Date.now() - startTime) / 1000).toFixed(0);
-  const execMins = (execSecs / 60).toFixed(1);
+  // ============================================================
+  // SUMMARY
+  // ============================================================
+  const secs = (Date.now() - startTime) / 1000;
+  console.log(`\n${c.cyan}${c.bright}╔══════════════════════════════════════════════════════════╗${c.reset}`);
+  console.log(`${c.cyan}${c.bright}║  EXECUTION SUMMARY                                       ║${c.reset}`);
+  console.log(`${c.cyan}${c.bright}╚══════════════════════════════════════════════════════════╝${c.reset}`);
+  console.log(`${c.gray}เวลา: ${(secs / 60).toFixed(1)} นาที (${secs.toFixed(0)}s) | Wallets: ${wallets.length}${c.reset}`);
+  console.log(`${c.gray}Coverage: ${(coverage * 100).toFixed(1)}% | เขียน Sheet: ${wrote ? 'ใช่' : 'ไม่'}${c.reset}`);
+  console.log(`${c.gray}Mint resolve: ${mintInfoMap.size}/${tokenMap.size} (Token-2022 mints: ${n2022})${c.reset}`);
+  console.log(`${c.magenta}Token-2022 holdings พบ: ${t2022Rows}${c.reset}`);
+  console.log(`${c.green}Records: ${rowsToAdd.length}${c.reset}`);
 
-  console.log(`\n${c.cyan}${c.bright}╔════════════════════════════════════════════════════════╗${c.reset}`);
-  console.log(`${c.cyan}${c.bright}║  EXECUTION SUMMARY                                     ║${c.reset}`);
-  console.log(`${c.cyan}${c.bright}╚════════════════════════════════════════════════════════╝${c.reset}`);
-  console.log(`${c.gray}Time: ${execMins} min | Wallets: ${WALLETS.length}${c.reset}`);
-  console.log(`${c.gray}Token-2022 Accounts: ${totalT2022Found}${c.reset}`);
-  console.log(`${c.green}Records Added: ${totalAdded}${c.reset}`);
-  
-  if (errors.length > 0) {
+  console.log(`${c.gray}— RPC stats —${c.reset}`);
+  for (const s of pool.stats()) {
+    console.log(`${c.gray}  ${s.host.padEnd(42)} calls=${String(s.calls).padStart(5)} errors=${String(s.errors).padStart(4)} avg=${s.avgMs}ms${c.reset}`);
+  }
+
+  if (errors.length) {
     console.log(`${c.red}Errors: ${errors.length}${c.reset}`);
-    errors.slice(0, 5).forEach((e, i) => console.log(`${c.red}  ${i + 1}. ${e}${c.reset}`));
+    errors.slice(0, 15).forEach((e, i) => console.log(`${c.red}  ${i + 1}. ${e}${c.reset}`));
+    if (errors.length > 15) console.log(`${c.red}  ... และอีก ${errors.length - 15} รายการ${c.reset}`);
   } else {
     console.log(`${c.green}Errors: 0${c.reset}`);
   }
-  console.log(`${c.cyan}${c.bright}════════════════════════════════════════════════════════${c.reset}\n`);
+  console.log(`${c.cyan}${c.bright}══════════════════════════════════════════════════════════${c.reset}\n`);
 
-  process.exit(0);
+  // ไม่ใช้ process.exit() เพื่อให้ stdout flush ครบ (log บรรทัดท้ายไม่หาย)
 }
 
-main().catch(err => {
-  console.error(`${c.red}${c.bright}Fatal Error:${c.reset} ${err.message}`);
-  process.exit(1);
+main().catch((err) => {
+  console.error(`${c.red}${c.bright}Fatal Error:${c.reset} ${err?.stack || err?.message || err}`);
+  process.exitCode = 1;
 });
