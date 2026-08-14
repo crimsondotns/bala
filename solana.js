@@ -80,9 +80,18 @@ const CONFIG = {
   breakerCooldownMs: 30000,
   // ขนาด batch ของ getMultipleAccounts (ข้อจำกัด RPC = 100)
   batchSize: 100,
-  // จำนวน TCP socket สูงสุดต่อ 1 origin — mainnet-beta จำกัด "connection rate"
-  // ไม่ใช่ request rate การ reuse socket จึงสำคัญกว่าการลด concurrency
+  // จำนวน TCP socket สูงสุดต่อ 1 origin
   maxSockets: Number(process.env.MAX_SOCKETS || 6),
+  /**
+   * เพดาน request ต่อวินาทีทั้งโปรเซส (นับ retry ด้วย)
+   *
+   * api.mainnet-beta จำกัด 40 request/10s ต่อ IP สำหรับ RPC method เดียว
+   * log 2026-08-14 05:55 ยิงไป 830 calls ใน 210s = 39.5/10s → ชนเพดานพอดี
+   * และ 247 ครั้ง (30%) กลายเป็น 429 ที่ต้อง retry
+   * 3.3 req/s = 33/10s เหลือ headroom ให้ retry โดยไม่ทะลุเพดาน
+   */
+  rateLimitRps: Number(process.env.RATE_LIMIT_RPS || 3.3),
+  rateBurst: Number(process.env.RATE_BURST || 5),
 };
 
 /**
@@ -138,6 +147,41 @@ function computeCoverage({ tokenCount, mintFailed, cellsChecked, cellsAttempted 
   const mint = tokenCount ? 1 - mintFailed / tokenCount : 1;
   const cells = cellsAttempted ? cellsChecked / cellsAttempted : 0;
   return { mint, cells, total: mint * cells };
+}
+
+/**
+ * Token bucket จำกัด "อัตรา" request ทั้งโปรเซส
+ *
+ * ต่างจาก concurrency limiter: การลด concurrency ไม่ได้จำกัดอัตรา เพราะคำขอที่
+ * ตอบเร็วจะถูกยิงชุดใหม่ต่อทันที จึงยังทะลุเพดานต่อวินาทีของ RPC ได้
+ * ตัวนี้ต้องครอบ retry ด้วย ไม่งั้น 429 จะสร้าง retry ที่ไปกิน quota ซ้ำ
+ */
+function createRateLimiter(ratePerSec, burst) {
+  let tokens = burst;
+  let last = Date.now();
+  let chain = Promise.resolve();
+
+  const take = async () => {
+    for (;;) {
+      const now = Date.now();
+      tokens = Math.min(burst, tokens + ((now - last) / 1000) * ratePerSec);
+      last = now;
+      if (tokens >= 1) { tokens -= 1; return; }
+      await delay(Math.max(5, Math.ceil(((1 - tokens) / ratePerSec) * 1000)));
+    }
+  };
+
+  // ต่อคิวเป็นสายเดียว กัน caller พร้อมกันหลายตัวเห็น token เดียวกันแล้วหยิบซ้ำ
+  return () => (chain = chain.then(take));
+}
+
+/** แปลงค่า Retry-After (วินาที หรือ HTTP-date) เป็น ms — คืน 0 ถ้าอ่านไม่ได้ */
+function parseRetryAfter(value) {
+  if (!value) return 0;
+  const secs = Number(value);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
 }
 
 /** ตัวจำกัด concurrency แบบ inline — ไม่ต้องลง p-limit เพิ่ม */
@@ -226,7 +270,7 @@ function classifyError(err) {
  * Promise.race แค่ทิ้ง promise ที่แพ้ ไม่ได้ปิด connection
  * AbortController ยกเลิก request จริง -> socket ถูกคืน pool เสมอ
  */
-function makeConn(endpoint, timeoutMs) {
+function makeConn(endpoint, timeoutMs, onRateLimited) {
   return new Connection(endpoint, {
     commitment: 'confirmed',
     disableRetryOnRateLimit: true, // กัน retry ซ้อน retry ของ web3.js
@@ -234,7 +278,10 @@ function makeConn(endpoint, timeoutMs) {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), timeoutMs);
       try {
-        return await fetch(url, { ...opts, signal: ac.signal });
+        const res = await fetch(url, { ...opts, signal: ac.signal });
+        // header ไปไม่ถึง error ของ web3.js จึงต้องดักตรงนี้
+        if (res.status === 429) onRateLimited?.(parseRetryAfter(res.headers.get('retry-after')));
+        return res;
       } finally {
         clearTimeout(timer);
       }
@@ -243,20 +290,35 @@ function makeConn(endpoint, timeoutMs) {
 }
 
 class RpcPool {
-  constructor(urls, timeoutMs) {
-    this.nodes = urls.map((u) => ({
-      url: u,
-      host: (() => { try { return new URL(u).host; } catch { return u; } })(),
-      conn: makeConn(u, timeoutMs),
-      consecFails: 0,
-      openUntil: 0,
-      disabled: false,
-      disabledReason: '',
-      inflight: 0,
-      calls: 0,
-      errors: 0,
-      totalMs: 0,
-    }));
+  constructor(urls, timeoutMs, opts = {}) {
+    // rateLimit ถูกฉีดเข้ามาได้เพื่อให้เทสต์คุมเวลาเองโดยไม่ต้องรอจริง
+    this.acquire = opts.rateLimit
+      ?? createRateLimiter(CONFIG.rateLimitRps, CONFIG.rateBurst);
+    this.throttled = 0; // จำนวนครั้งที่ RPC ส่ง Retry-After กลับมา
+
+    this.nodes = urls.map((u) => {
+      const node = {
+        url: u,
+        host: (() => { try { return new URL(u).host; } catch { return u; } })(),
+        // เก็บเป็น "เวลาสิ้นสุด" ไม่ใช่ระยะเวลา — ค่าที่ค้างจาก 429 เก่าจะเสื่อม
+        // ไปเองตามเวลา แทนที่จะไปหน่วง retry ในอนาคตเต็มจำนวน
+        retryAfterUntil: 0,
+        consecFails: 0,
+        openUntil: 0,
+        disabled: false,
+        disabledReason: '',
+        inflight: 0,
+        calls: 0,
+        errors: 0,
+        totalMs: 0,
+      };
+      node.conn = makeConn(u, timeoutMs, (ms) => {
+        // จำค่าที่ server บอกมา ดีกว่าเดา backoff เอง
+        if (ms > 0) node.retryAfterUntil = Date.now() + ms;
+        this.throttled++;
+      });
+      return node;
+    });
     if (!this.nodes.length) throw new Error('RpcPool: ไม่มี endpoint');
   }
 
@@ -323,6 +385,10 @@ class RpcPool {
       const n = this.pick(tried);
       if (!n) break;
 
+      // สำคัญ: กั้นอัตราก่อน "ทุก" attempt รวม retry ด้วย
+      // ไม่งั้น 429 หนึ่งครั้งจะสร้าง retry ที่ไปกิน quota ซ้ำจนเกิด 429 ต่อเนื่อง
+      await this.acquire();
+
       n.inflight++;
       n.calls++;
       const t0 = Date.now();
@@ -338,10 +404,13 @@ class RpcPool {
         tried.add(n.host);
 
         const kind = classifyError(e);
+        const retryAfter = Math.max(0, n.retryAfterUntil - Date.now());
+        n.retryAfterUntil = 0; // ใช้ครั้งเดียว
         jlog({
           evt: 'rpc_retry', label, host: n.host,
           attempt: attempt + 1, ms: Date.now() - t0, kind,
           status: httpStatusOf(e) || undefined,
+          retryAfterMs: retryAfter || undefined,
           msg: (e?.message || '').slice(0, 160),
         });
 
@@ -355,8 +424,9 @@ class RpcPool {
         attempt++;
         if (attempt < CONFIG.maxRetries) {
           const base = kind === 'ratelimit' ? 2000 : 500;
-          const wait = Math.min(15000, base * 2 ** (attempt - 1)) * (0.7 + Math.random() * 0.6);
-          await delay(wait);
+          const backoff = Math.min(15000, base * 2 ** (attempt - 1)) * (0.7 + Math.random() * 0.6);
+          // ถ้า server บอก Retry-After มา ให้เชื่อ server ก่อนการเดาของเรา
+          await delay(Math.min(30000, Math.max(backoff, retryAfter)));
         }
       } finally {
         n.inflight--;
@@ -671,7 +741,8 @@ async function main() {
   const pool = new RpcPool(rpcUrls, CONFIG.rpcTimeoutMs);
   rpcUrls.forEach((u) => console.log(`${c.gray}  • ${u}${c.reset}`));
   console.log(`${c.gray}  timeout=${CONFIG.rpcTimeoutMs}ms concurrency=${CONFIG.concurrency} ` +
-    `retries=${CONFIG.maxRetries} maxSockets=${CONFIG.maxSockets} keepAlive=${agentOk ? 'on' : 'off'}${c.reset}`);
+    `retries=${CONFIG.maxRetries} maxSockets=${CONFIG.maxSockets} keepAlive=${agentOk ? 'on' : 'off'} ` +
+    `rate=${CONFIG.rateLimitRps}req/s${c.reset}`);
   if (!agentOk) {
     console.log(`${c.yellow}⚠ ตั้ง keep-alive agent ไม่ได้ (ไม่พบ undici) — เสี่ยงโดน 429 connection-rate${c.reset}`);
   }
@@ -719,7 +790,8 @@ async function main() {
 
   const limit = createLimiter(CONFIG.concurrency);
   const rowsToAdd = [];
-  const errors = [];
+  const errors = [];      // ทำให้ข้อมูลของ wallet นั้นหายทั้งก้อน
+  const warnings = [];    // ได้ข้อมูลบางส่วน — ไม่ใช่ความล้มเหลว
   let okCount = 0;        // wallet ที่สแกนครบทุก batch
   let partialCount = 0;   // wallet ที่ได้ข้อมูลบางส่วน
   let t2022Rows = 0;
@@ -766,7 +838,7 @@ async function main() {
       } else if (failedBatches > 0) {
         // ได้ข้อมูลบางส่วน — เก็บไว้ แต่ต้องไม่นับเป็นสำเร็จเต็ม
         partialCount++;
-        errors.push(`${wallet.name} [partial ${checked}/${attempted}]: ${lastError?.message || lastError}`);
+        warnings.push(`${wallet.name} [ขาด ${attempted - checked}/${attempted} mint]: ${lastError?.message || lastError}`);
         console.log(`${tag0} ${wallet.name.padEnd(35, ' ')} ` +
           `${c.yellow}⚠ ${String(found.length).padStart(2, '0')} tokens (บางส่วน ${checked}/${attempted})${c.reset}${tag} ${took}`);
       } else {
@@ -848,7 +920,7 @@ async function main() {
   console.log(`${c.magenta}Token-2022 holdings พบ: ${t2022Rows}${c.reset}`);
   console.log(`${c.green}Records: ${rowsToAdd.length}${c.reset}`);
 
-  console.log(`${c.gray}— RPC stats —${c.reset}`);
+  console.log(`${c.gray}— RPC stats — (rate limit ${CONFIG.rateLimitRps} req/s, throttled ${pool.throttled} ครั้ง)${c.reset}`);
   for (const s of pool.stats()) {
     const rate = s.calls ? ((s.errors / s.calls) * 100).toFixed(0) : '0';
     const flag = s.disabled ? `${c.red} [DISABLED:${s.disabledReason}]${c.reset}` : '';
@@ -856,9 +928,19 @@ async function main() {
       `errors=${String(s.errors).padStart(4)} (${rate.padStart(3)}%) avg=${s.avgMs}ms${c.reset}${flag}`);
   }
 
+  // แยก Warnings ออกจาก Errors — partial คือ "ข้อมูลไม่ครบ" ไม่ใช่ "งานล้มเหลว"
+  // การเอาไปกองรวมกันทำให้ summary ดูเหมือนพังทั้งที่ job ผ่าน
+  if (warnings.length) {
+    console.log(`${c.yellow}Warnings: ${warnings.length} (wallet ที่ได้ข้อมูลบางส่วน)${c.reset}`);
+    warnings.slice(0, 10).forEach((w, i) =>
+      console.log(`${c.yellow}  ${i + 1}. ${String(w).replace(/\s+/g, ' ').slice(0, 150)}${c.reset}`));
+    if (warnings.length > 10) console.log(`${c.yellow}  ... และอีก ${warnings.length - 10} รายการ${c.reset}`);
+  }
+
   if (errors.length) {
     console.log(`${c.red}Errors: ${errors.length}${c.reset}`);
-    errors.slice(0, 15).forEach((e, i) => console.log(`${c.red}  ${i + 1}. ${e}${c.reset}`));
+    errors.slice(0, 15).forEach((e, i) =>
+      console.log(`${c.red}  ${i + 1}. ${String(e).replace(/\s+/g, ' ').slice(0, 150)}${c.reset}`));
     if (errors.length > 15) console.log(`${c.red}  ... และอีก ${errors.length - 15} รายการ${c.reset}`);
   } else {
     console.log(`${c.green}Errors: 0${c.reset}`);
@@ -882,4 +964,5 @@ if (isCli) {
 export {
   RpcPool, classifyError, httpStatusOf, CONFIG,
   computeCoverage, scanWalletByAta,
+  createRateLimiter, parseRetryAfter,
 };
