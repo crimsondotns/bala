@@ -4,11 +4,26 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dedupeNetworksByChainId, computeEvmCoverage, MIN_COVERAGE } from '../evm.js';
+import {
+  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, MIN_COVERAGE,
+} from '../evm.js';
 
 /** probe ปลอม: map ชื่อ -> chainId ถ้าไม่มีในแมพให้ถือว่าถาม chainId ไม่ได้ */
 function fakeProbe(map) {
   return async (entry) => {
+    if (!(entry.name in map)) throw new Error('timeout');
+    return { chainId: map[entry.name], provider: { __for: entry.name } };
+  };
+}
+
+/** probe ที่โยน error แบบ "สแกนไม่ได้เลย" สำหรับชื่อที่ระบุ */
+function probeWithUnsupported(map, unsupportedNames) {
+  return async (entry) => {
+    if (unsupportedNames.includes(entry.name)) {
+      const e = new Error('ปลายทางนี้ไม่ใช่ EVM JSON-RPC');
+      e.unsupported = true;
+      throw e;
+    }
     if (!(entry.name in map)) throw new Error('timeout');
     return { chainId: map[entry.name], provider: { __for: entry.name } };
   };
@@ -79,6 +94,50 @@ test('รายการว่างไม่ throw', async () => {
   const { networks, merged } = await dedupeNetworksByChainId([], fakeProbe({}));
   assert.deepEqual(networks, []);
   assert.deepEqual(merged, []);
+});
+
+// ---- เชนที่สแกนไม่ได้เลย ----
+
+test('isNotEvmRpc แยก "ไม่ใช่ EVM" ออกจาก "ล่มชั่วคราว"', () => {
+  // ข้อความจริงจาก run 2026-08-26
+  assert.equal(isNotEvmRpc(new Error('server response 501 Not Implemented')), true, 'Injective');
+  assert.equal(isNotEvmRpc(new Error('405 Method Not Allowed')), true, 'Tron');
+  assert.equal(isNotEvmRpc(new Error('error={ "code": -32601, "message": "Method not found" }')), true, 'Sui');
+
+  // พวกนี้คือล่มชั่วคราว ต้องไม่ถูกตัดทิ้งถาวร
+  assert.equal(isNotEvmRpc(new Error('timeout (chainId)')), false);
+  assert.equal(isNotEvmRpc(new Error('server response 500 Internal Server Error')), false);
+  assert.equal(isNotEvmRpc(new Error('could not detect network')), false);
+  assert.equal(isNotEvmRpc(new Error('ECONNREFUSED')), false);
+  assert.equal(isNotEvmRpc(undefined), false);
+});
+
+test('regression: เชนที่ไม่ใช่ EVM ถูกคัดออก ไม่ปนกับเชนที่ล่มชั่วคราว', () => {
+  // run 2026-08-26: Injective/Sui/Tron อยู่ในแท็บ nodes ทั้งที่ worker อ่านไม่ได้
+  // ทำให้ coverage ค้างที่ 75% ทุกรอบ และไม่มีวันได้เขียนชีตอีก
+  return dedupeNetworksByChainId([
+    { name: 'Ethereum', url: 'u1' },
+    { name: 'Injective', url: 'u2' },
+    { name: 'Sui', url: 'u3' },
+    { name: 'Tron', url: 'u4' },
+    { name: 'Flaky', url: 'u5' },      // ล่มชั่วคราว — ต้องยังถูกสแกน
+  ], probeWithUnsupported({ Ethereum: '1' }, ['Injective', 'Sui', 'Tron']))
+    .then(({ networks, unsupported }) => {
+      assert.deepEqual(unsupported.map((u) => u.name), ['Injective', 'Sui', 'Tron']);
+      assert.deepEqual(networks.map((n) => n.name), ['Ethereum', 'Flaky'],
+        'เชนที่ล่มชั่วคราวต้องยังถูกสแกน ไม่ถูกตัดทิ้งถาวร');
+    });
+});
+
+test('เชนที่สแกนไม่ได้ต้องไม่ถูกนับเป็นเชนซ้ำ', async () => {
+  const { networks, merged, unsupported } = await dedupeNetworksByChainId([
+    { name: 'Sui', url: 'u1' },
+    { name: 'Tron', url: 'u2' },
+  ], probeWithUnsupported({}, ['Sui', 'Tron']));
+
+  assert.equal(networks.length, 0);
+  assert.equal(merged.length, 0, 'สองตัวที่สแกนไม่ได้ ไม่ใช่ "เชนเดียวกัน"');
+  assert.equal(unsupported.length, 2);
 });
 
 // ---- coverage guard ----
