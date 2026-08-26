@@ -100,7 +100,69 @@ function formatDate(date) {
 }
 
 /**
- * ถาม chainId จาก RPC จริง แล้วรวมรายการที่เป็นเชนเดียวกันให้เหลือตัวเดียว
+ * error ที่แปลว่า "ปลายทางนี้ไม่ใช่ EVM JSON-RPC" ไม่ใช่ "ล่มชั่วคราว"
+ * เช่น Injective ตอบ 501, Tron ตอบ 405, Sui ตอบ -32601 Method not found
+ * แยกออกจากกันเพราะอันแรกจะไม่มีวันหาย ส่วนอันหลังรอแล้วอาจกลับมา
+ */
+function isNotEvmRpc(err) {
+  const msg = String(err?.message || err || '');
+  return /not implemented|method not found|-32601|-32701|\b501\b|\b405\b|Method Not Allowed/i.test(msg);
+}
+
+/** ปิด provider แบบไม่โยน error (provider ปลอมในเทสต์ไม่มี destroy) */
+function destroyProvider(provider) {
+  try {
+    if (typeof provider?.destroy === 'function') provider.destroy();
+  } catch { /* ปิดไม่ได้ก็ปล่อย */ }
+}
+
+const withTimeout = (p, ms, label) => Promise.race([
+  p,
+  new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout (${label})`)), ms)),
+]);
+
+/**
+ * ตรวจ 2 อย่างในรอบเดียว: chainId และ Multicall3 มีอยู่บนเชนนี้ไหม
+ *
+ * worker ตัวนี้อ่านยอดผ่าน Multicall3 อย่างเดียว เชนที่ไม่มีสัญญานี้จึงสแกนไม่ได้เลย
+ * ไม่ว่าจะรอนานแค่ไหน — ต้องแยกออกจาก "เชนที่ล่มชั่วคราว" ไม่งั้น coverage
+ * จะถูกกดต่ำค้างตลอดกาลจนไม่มีวันได้เขียนชีตอีก
+ */
+async function probeChainId(entry) {
+  const provider = new JsonRpcProvider(entry.url, undefined, { staticNetwork: true });
+  let net;
+  try {
+    net = await withTimeout(provider.getNetwork(), CHAIN_ID_TIMEOUT_MS, 'chainId');
+  } catch (err) {
+    provider.destroy();
+    if (isNotEvmRpc(err)) {
+      const e = new Error('ปลายทางนี้ไม่ใช่ EVM JSON-RPC');
+      e.unsupported = true;
+      throw e;
+    }
+    throw err;
+  }
+
+  // มี Multicall3 อยู่จริงไหม — ไม่มี code ที่ที่อยู่นั้น = สแกนด้วย worker ตัวนี้ไม่ได้
+  try {
+    const code = await withTimeout(
+      provider.getCode(MULTICALL3_ADDRESS), CHAIN_ID_TIMEOUT_MS, 'multicall');
+    if (!code || code === '0x') {
+      provider.destroy();
+      const e = new Error(`ไม่มี Multicall3 บนเชนนี้ (chainId ${net.chainId})`);
+      e.unsupported = true;
+      throw e;
+    }
+  } catch (err) {
+    if (err.unsupported) throw err;
+    // ถาม getCode ไม่ได้ = อาจแค่ล่มชั่วคราว ปล่อยให้ลองสแกนต่อ
+  }
+
+  return { chainId: String(net.chainId), provider };
+}
+
+/**
+ * รวมรายการที่เป็นเชนเดียวกันให้เหลือตัวเดียว และคัดเชนที่สแกนไม่ได้ออก
  *
  * คอลัมน์ Network ใน Sheet คือ "ข้อความที่คนพิมพ์" ไม่ใช่ค่าที่มาจากบล็อกเชน
  * ถ้าแท็บ nodes มี 2 แถวที่ URL ชี้ไปเชนเดียวกันแต่ตั้งชื่อคนละอย่าง
@@ -110,22 +172,19 @@ function formatDate(date) {
  * chainId จะต่างกันและไม่มีอะไรถูกรวม — ไม่มีทางรวมผิด
  *
  * แถวที่อยู่บนสุดในแท็บ nodes เป็นตัวที่ถูกเก็บไว้ (สลับได้โดยย้ายลำดับแถว)
+ *
+ * คืน 3 กลุ่ม: networks (สแกนต่อ) · merged (เชนซ้ำ) · unsupported (สแกนไม่ได้เลย)
  */
-async function probeChainId(entry) {
-  const provider = new JsonRpcProvider(entry.url, undefined, { staticNetwork: true });
-  const net = await Promise.race([
-    provider.getNetwork(),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), CHAIN_ID_TIMEOUT_MS)),
-  ]);
-  return { chainId: String(net.chainId), provider };
-}
-
 async function dedupeNetworksByChainId(entries, probe = probeChainId) {
   const probes = await Promise.all(entries.map(async (e) => {
     try {
       const { chainId, provider } = await probe(e);
       return { ...e, chainId: String(chainId), provider };
     } catch (err) {
+      if (err?.unsupported) {
+        // worker ตัวนี้อ่านเชนนี้ไม่ได้เลย ไม่ใช่เรื่องชั่วคราว
+        return { ...e, unsupported: true, error: err.message };
+      }
       // ถาม chainId ไม่ได้ ก็ยังปล่อยให้ลองสแกน แล้วไปพังตอนนั้นพร้อมรายงาน error
       // ใช้ url เป็นคีย์แทน เพื่อไม่ให้ถูกรวมกับใครโดยไม่มีหลักฐาน
       return { ...e, chainId: null, key: e.url, error: err?.message || String(err) };
@@ -134,15 +193,18 @@ async function dedupeNetworksByChainId(entries, probe = probeChainId) {
 
   const byChain = new Map();
   const merged = [];
+  const unsupported = [];
   for (const p of probes) {
+    if (p.unsupported) { unsupported.push(p); continue; }
     const key = p.chainId ?? p.key;
     if (byChain.has(key)) {
       merged.push({ kept: byChain.get(key).name, dropped: p.name, chainId: p.chainId });
+      destroyProvider(p.provider); // ตัวที่ถูกรวมทิ้ง ต้องปิดไม่ให้ค้าง event loop
       continue;
     }
     byChain.set(key, p);
   }
-  return { networks: [...byChain.values()], merged };
+  return { networks: [...byChain.values()], merged, unsupported };
 }
 
 /**
@@ -303,12 +365,19 @@ async function main() {
 
   // ---- รวมเครือข่ายที่เป็นเชนเดียวกัน ก่อนเริ่มอ่านยอด ----
   console.log(`\n${c.cyan}${c.bright}>> Checking chain IDs of ${rpcEntries.length} network(s)...${c.reset}`);
-  const { networks, merged } = await dedupeNetworksByChainId(rpcEntries);
+  const { networks, merged, unsupported } = await dedupeNetworksByChainId(rpcEntries);
 
   for (const m of merged) {
     console.log(`   ${c.yellow}⏭${c.reset} ${c.gray}${m.dropped.padEnd(14)}${c.reset} ` +
       `เป็นเชนเดียวกับ ${c.bright}${m.kept}${c.reset} (chainId ${m.chainId}) — ` +
       `${c.gray}อ่านรอบเดียวพอ ไม่งั้นยอดเดิมจะถูกเขียน 2 แถว${c.reset}`);
+  }
+  for (const u of unsupported) {
+    // ไม่นับใน coverage เพราะไม่ใช่ความล้มเหลวชั่วคราว ถ้านับ coverage จะต่ำค้าง
+    // ตลอดกาลจนไม่มีวันได้เขียนชีตอีก — แต่ต้องบอกให้ชัดว่าเชนนี้ไม่ได้ถูกอ่าน
+    console.log(`   ${c.yellow}⊘${c.reset} ${c.gray}${u.name.padEnd(14)}${c.reset} ` +
+      `${c.yellow}ข้ามทั้งเชน${c.reset} — ${u.error} ` +
+      `${c.gray}(worker นี้อ่านผ่าน Multicall3 บน EVM เท่านั้น)${c.reset}`);
   }
   for (const n of networks) {
     if (n.chainId) {
@@ -576,7 +645,12 @@ async function main() {
   console.log(`Execution Time: ${execSecs} seconds`);
   console.log(`Coverage:       ${(coverage * 100).toFixed(1)}%  |  Wrote sheet: ${wrote ? 'yes' : 'no'}`);
   console.log(`Networks:       ${networks.length} scanned` +
-    (merged.length ? `, ${merged.length} merged as same chain` : ''));
+    (merged.length ? `, ${merged.length} merged as same chain` : '') +
+    (unsupported.length ? `, ${unsupported.length} skipped (ไม่รองรับ)` : ''));
+  if (unsupported.length) {
+    console.log(`${c.yellow}Skipped:        ${unsupported.map(u => u.name).join(', ')}` +
+      ` — ไม่ได้ถูกอ่านและไม่ถูกนับใน Coverage${c.reset}`);
+  }
   console.log(`${c.green}Total Found:    ${totalFound}${c.reset}`);
   console.log(`${c.gray}Total Empty:    ${totalEmpty}${c.reset}`);
   if (dupSkipped > 0) console.log(`${c.yellow}Duplicates:     ${dupSkipped} skipped${c.reset}`);
@@ -591,7 +665,19 @@ async function main() {
   }
   console.log(`${c.gray}--------------------------------------------------${c.reset}`);
 
-  // ไม่เรียก process.exit() เพื่อให้ stdout flush ครบ และคง exit code ที่ตั้งไว้
+  /**
+   * ปิด provider ทุกตัว ไม่งั้นโปรเซสไม่จบ
+   *
+   * ethers จะพยายามต่อใหม่ทุกวินาทีไปเรื่อย ๆ กับปลายทางที่ตอบไม่ได้
+   * ("failed to detect network ... retry in 1s") timer พวกนี้ค้าง event loop ไว้
+   * ตอนที่ยังมี process.exit(0) ปิดท้าย ปัญหานี้ถูกกลบไว้ พอเอาออกเพื่อให้
+   * exit code ทำงานถูกต้อง มันเลยโผล่มาเป็น job ที่ค้างจนถูก cancel
+   */
+  for (const n of networks) destroyProvider(n.provider);
+
+  // กันเหนียว: ถ้ายังมี handle อะไรค้างอยู่ ให้จบใน 5 วินาทีด้วย exit code เดิม
+  // unref() ทำให้ timer นี้ไม่ยื้อโปรเซสเอง ถ้าทุกอย่างสะอาดก็จบทันทีไม่ต้องรอ
+  setTimeout(() => process.exit(process.exitCode ?? 0), 5000).unref();
 }
 
 // รันเฉพาะตอนถูกเรียกเป็นสคริปต์ — ทำให้ import มาเทสต์ฟังก์ชันย่อยได้โดยไม่สแกนจริง
@@ -605,4 +691,4 @@ if (isCli) {
   });
 }
 
-export { dedupeNetworksByChainId, computeEvmCoverage, MIN_COVERAGE };
+export { dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, MIN_COVERAGE };
