@@ -3,6 +3,7 @@ import { GoogleSpreadsheet } from 'google-spreadsheet';
 import { JWT } from 'google-auth-library';
 
 import dotenv from 'dotenv';
+import { pathToFileURL } from 'node:url';
 dotenv.config();
 
 const c = {
@@ -27,6 +28,11 @@ const SUBSCRIPTION_ERC20_TAB = 'SUBSCRIPTION ERC20';
 const SHEET_HEADERS = ['Tokens Name', 'Network', 'Tokens Address', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const MULTICALL_BATCH_SIZE = 500;
+
+// สัดส่วนข้อมูลขั้นต่ำที่ต้องอ่านได้ ถึงจะยอมเขียนทับ Sheet
+const MIN_COVERAGE = Number(process.env.MIN_COVERAGE || 0.95);
+// timeout ตอนถาม chainId ของแต่ละ RPC
+const CHAIN_ID_TIMEOUT_MS = Number(process.env.CHAIN_ID_TIMEOUT_MS || 10000);
 
 // Multicall3 ABI
 const MULTICALL3_ABI = [
@@ -93,6 +99,66 @@ function formatDate(date) {
   return `${partMap.month}/${partMap.day}/${partMap.year} ${partMap.hour}:${partMap.minute}:${partMap.second}`;
 }
 
+/**
+ * ถาม chainId จาก RPC จริง แล้วรวมรายการที่เป็นเชนเดียวกันให้เหลือตัวเดียว
+ *
+ * คอลัมน์ Network ใน Sheet คือ "ข้อความที่คนพิมพ์" ไม่ใช่ค่าที่มาจากบล็อกเชน
+ * ถ้าแท็บ nodes มี 2 แถวที่ URL ชี้ไปเชนเดียวกันแต่ตั้งชื่อคนละอย่าง
+ * (เช่น Hyperliquid กับ Hyperevm) โค้ดจะอ่านเชนนั้น 2 รอบและเขียนยอดเดียวกัน 2 แถว
+ *
+ * การเทียบด้วย chainId ปลอดภัยกว่ารายการชื่อพ้อง เพราะถ้าเป็นคนละเชนจริง
+ * chainId จะต่างกันและไม่มีอะไรถูกรวม — ไม่มีทางรวมผิด
+ *
+ * แถวที่อยู่บนสุดในแท็บ nodes เป็นตัวที่ถูกเก็บไว้ (สลับได้โดยย้ายลำดับแถว)
+ */
+async function probeChainId(entry) {
+  const provider = new JsonRpcProvider(entry.url, undefined, { staticNetwork: true });
+  const net = await Promise.race([
+    provider.getNetwork(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), CHAIN_ID_TIMEOUT_MS)),
+  ]);
+  return { chainId: String(net.chainId), provider };
+}
+
+async function dedupeNetworksByChainId(entries, probe = probeChainId) {
+  const probes = await Promise.all(entries.map(async (e) => {
+    try {
+      const { chainId, provider } = await probe(e);
+      return { ...e, chainId: String(chainId), provider };
+    } catch (err) {
+      // ถาม chainId ไม่ได้ ก็ยังปล่อยให้ลองสแกน แล้วไปพังตอนนั้นพร้อมรายงาน error
+      // ใช้ url เป็นคีย์แทน เพื่อไม่ให้ถูกรวมกับใครโดยไม่มีหลักฐาน
+      return { ...e, chainId: null, key: e.url, error: err?.message || String(err) };
+    }
+  }));
+
+  const byChain = new Map();
+  const merged = [];
+  for (const p of probes) {
+    const key = p.chainId ?? p.key;
+    if (byChain.has(key)) {
+      merged.push({ kept: byChain.get(key).name, dropped: p.name, chainId: p.chainId });
+      continue;
+    }
+    byChain.set(key, p);
+  }
+  return { networks: [...byChain.values()], merged };
+}
+
+/**
+ * สัดส่วนข้อมูลที่อ่านได้จริงในรอบนี้
+ *   metadata — ยิงถาม symbol/decimals สำเร็จกี่ token (token ที่ไม่มีบนเชนนั้น
+ *              ยังนับว่าสำเร็จ เพราะเรารู้คำตอบแล้วว่า "ไม่มี")
+ *   balance  — ยิงถามยอดสำเร็จกี่ช่อง (token × wallet)
+ * คูณกันเพื่อให้ความล้มเหลวของทั้งสองขั้นสะท้อนออกมาทั้งคู่
+ */
+function computeEvmCoverage({ metaIntended, metaOk, balIntended, balOk }) {
+  const meta = metaIntended ? metaOk / metaIntended : 0;
+  // ไม่มี balance call เลยทั้งที่ metadata ผ่าน = ไม่มี token บนเชนไหนเลย ถือว่าครบ
+  const bal = balIntended ? balOk / balIntended : (metaIntended ? 1 : 0);
+  return { meta, bal, total: meta * bal };
+}
+
 async function main() {
   const startTime = Date.now();
 
@@ -123,11 +189,13 @@ async function main() {
     process.exit(1);
   }
 
-  let RPC_URLS = {};
+  // เก็บเป็น array เพื่อรักษาลำดับแถวใน Sheet ไว้ใช้ตัดสินว่าชื่อไหนถูกเก็บตอนรวมเชน
+  let rpcEntries = [];
   try {
     const maxRows = nodesSheet.rowCount;
     if (maxRows >= 2) {
       await nodesSheet.loadCells(`A1:B${maxRows}`);
+      const seenName = new Set();
       for (let r = 1; r < maxRows; r++) {
         const netCell = nodesSheet.getCell(r, 0);
         const urlCell = nodesSheet.getCell(r, 1);
@@ -139,7 +207,9 @@ async function main() {
              let name = networkName;
              if (name.toLowerCase() === 'bsc') name = 'Bsc';
              else name = name.charAt(0).toUpperCase() + name.slice(1);
-             RPC_URLS[name] = rpcUrl;
+             if (seenName.has(name)) continue; // ชื่อซ้ำเป๊ะ — เดิม object key ก็ทับกันอยู่แล้ว
+             seenName.add(name);
+             rpcEntries.push({ name, url: rpcUrl });
           }
         }
       }
@@ -149,7 +219,7 @@ async function main() {
     process.exit(1);
   }
 
-  if (Object.keys(RPC_URLS).length === 0) {
+  if (rpcEntries.length === 0) {
     console.error("Fatal Error: No EVM RPCs found in 'nodes' tab.");
     process.exit(1);
   }
@@ -183,7 +253,7 @@ async function main() {
 
   if (WALLETS.length === 0) {
     console.log(`${c.red}No valid wallets found. Exiting.${c.reset}`);
-    process.exit(0);
+    process.exit(1); // ไม่มี wallet = ตั้งค่าผิด ไม่ใช่ "สำเร็จแต่ไม่มีอะไรทำ"
   }
   console.log(`${c.gray}Loaded ${WALLETS.length} wallet(s)${c.reset}`);
 
@@ -216,7 +286,7 @@ async function main() {
 
   if (TOKENS.length === 0) {
     console.log(`${c.red}No valid tokens found. Exiting.${c.reset}`);
-    process.exit(0);
+    process.exit(1); // ไม่มี token = ตั้งค่าผิด ไม่ใช่ "สำเร็จแต่ไม่มีอะไรทำ"
   }
   console.log(`${c.gray}Loaded ${TOKENS.length} token(s)${c.reset}`);
 
@@ -231,14 +301,41 @@ async function main() {
   const errors = [];
   const allResults = [];
 
-  const networks = Object.keys(RPC_URLS);
+  // ---- รวมเครือข่ายที่เป็นเชนเดียวกัน ก่อนเริ่มอ่านยอด ----
+  console.log(`\n${c.cyan}${c.bright}>> Checking chain IDs of ${rpcEntries.length} network(s)...${c.reset}`);
+  const { networks, merged } = await dedupeNetworksByChainId(rpcEntries);
+
+  for (const m of merged) {
+    console.log(`   ${c.yellow}⏭${c.reset} ${c.gray}${m.dropped.padEnd(14)}${c.reset} ` +
+      `เป็นเชนเดียวกับ ${c.bright}${m.kept}${c.reset} (chainId ${m.chainId}) — ` +
+      `${c.gray}อ่านรอบเดียวพอ ไม่งั้นยอดเดิมจะถูกเขียน 2 แถว${c.reset}`);
+  }
+  for (const n of networks) {
+    if (n.chainId) {
+      console.log(`   ${c.green}•${c.reset} ${c.gray}${n.name.padEnd(14)} chainId ${n.chainId}${c.reset}`);
+    } else {
+      console.log(`   ${c.yellow}?${c.reset} ${c.gray}${n.name.padEnd(14)} ` +
+        `ถาม chainId ไม่ได้ (${n.error}) — จะลองสแกนต่อ${c.reset}`);
+      errors.push(`[${n.name}] chainId probe failed: ${n.error}`);
+    }
+  }
+
+  // นับ "ช่องข้อมูล" ที่ตั้งใจอ่าน เทียบกับที่อ่านได้จริง เพื่อกันการเขียนทับด้วยข้อมูลไม่ครบ
+  let metaIntended = 0, metaOk = 0;
+  let balIntended = 0, balOk = 0;
+  // ตาข่ายกันพลาดชั้นสุดท้าย: chainId|token|wallet ต้องไม่ซ้ำ
+  const seenCell = new Set();
+  let dupSkipped = 0;
 
   // Process each network with error handling - skip failed networks
-  for (const network of networks) {
+  for (const netEntry of networks) {
+    const network = netEntry.name;
+    const chainKey = netEntry.chainId ?? netEntry.url;
+    const snapMeta = metaIntended, snapBal = balIntended;
     try {
       console.log(`\n${c.cyan}${c.bright}>> Network: ${network.toUpperCase()}${c.reset}`);
-      const rpcUrl = RPC_URLS[network];
-      const provider = new JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+      const provider = netEntry.provider
+        ?? new JsonRpcProvider(netEntry.url, undefined, { staticNetwork: true });
       const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
 
       // 1. Resolve Metadata via Multicall (No Redis - fetch fresh each run)
@@ -246,6 +343,7 @@ async function main() {
       const metaChunks = chunkArray(networkTokens, Math.floor(MULTICALL_BATCH_SIZE / 2));
 
       for (const chunk of metaChunks) {
+        metaIntended += chunk.length;
         const metaCalls = [];
         for (const pt of chunk) {
           metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("symbol") });
@@ -253,6 +351,8 @@ async function main() {
         }
         try {
           const results = await multicall.aggregate3.staticCall(metaCalls);
+          // ยิงสำเร็จแล้ว — token ที่ success:false คือ "ไม่มีบนเชนนี้" ไม่ใช่ความล้มเหลว
+          metaOk += chunk.length;
           for (let i = 0; i < chunk.length; i++) {
             const pt = chunk[i];
             const symRes = results[i * 2];
@@ -274,10 +374,12 @@ async function main() {
           }
         } catch (err) {
           const errMsg = err.shortMessage || err.message.split(' (')[0];
-          console.log(`${c.gray}   Metadata fetch failed: ${errMsg}${c.reset}`);
-          for (const pt of chunk) { 
+          console.log(`${c.red}   Metadata fetch failed: ${errMsg}${c.reset}`);
+          // ต่างจากกรณีบน: ยิงไม่สำเร็จ = ไม่รู้ว่า token เหล่านี้มีบนเชนนี้หรือไม่
+          errors.push(`[${network}] Metadata batch failed (${chunk.length} tokens): ${errMsg}`);
+          for (const pt of chunk) {
             pt.symbol = pt.sheetSymbol || 'Unknown';
-            pt.success = false; 
+            pt.success = false;
           }
         }
       }
@@ -314,10 +416,12 @@ async function main() {
         const batchInfo = `${c.gray}[${String(chunkIdx + 1).padStart(2, '0')}/${String(balChunks.length).padStart(2, '0')}]${c.reset}`;
         const processInfo = `Processing ${String(chunk.length).padStart(3, ' ')} calls...`;
         process.stdout.write(`   ${batchInfo} ${processInfo} `);
+        balIntended += chunk.length;
 
         try {
           const results = await multicall.aggregate3.staticCall(chunk);
-          
+          balOk += chunk.length;
+
           for (let k = 0; k < results.length; k++) {
             const res = results[k];
             const m = mapping[k];
@@ -329,6 +433,11 @@ async function main() {
                 const balanceFloat = parseFloat(balanceStr);
 
                 if (balanceFloat > 0) {
+                  // ตาข่ายชั้นสุดท้าย เผื่อมีทางอื่นที่ทำให้ช่องเดิมถูกอ่านซ้ำ
+                  const cellKey = `${chainKey}|${m.token.address.toLowerCase()}|${m.wallet.address.toLowerCase()}`;
+                  if (seenCell.has(cellKey)) { dupSkipped++; continue; }
+                  seenCell.add(cellKey);
+
                   const nowStr = formatDate(new Date());
                   allResults.push({
                     'Tokens Name': m.token.symbol,
@@ -369,6 +478,11 @@ async function main() {
       const errMsg = err.shortMessage || err.message.split(' (')[0];
       console.log(`${c.red}   Network ${network} failed: ${errMsg}. Skipping to next network.${c.reset}`);
       errors.push(`[${network}] Network failed: ${errMsg}`);
+      // เชนนี้ไม่ได้ข้อมูลเลย — ต้องนับเป็นช่องที่ตั้งใจอ่านแต่อ่านไม่ได้
+      // ไม่งั้น coverage จะดูสมบูรณ์ทั้งที่ข้อมูลทั้งเชนหายไป แล้วไปเขียนทับของเดิม
+      // เติมเฉพาะส่วนที่ยังไม่ถูกนับไปก่อนหน้า เพื่อไม่ให้นับซ้ำถ้าพังกลางทาง
+      metaIntended += Math.max(0, TOKENS.length - (metaIntended - snapMeta));
+      balIntended += Math.max(0, (TOKENS.length * WALLETS.length) - (balIntended - snapBal));
       continue;
     }
   }
@@ -381,41 +495,76 @@ async function main() {
     return new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
   }
 
-  console.log(`\n${c.cyan}${c.bright}>> Writing to Google Sheets...${c.reset}`);
-  console.log(`${c.gray}   Collected ${allResults.length} rows from ${networks.length} network(s)${c.reset}`);
+  /**
+   * Coverage guard — เขียนทับ Sheet ต่อเมื่ออ่านข้อมูลได้ครบพอ
+   *
+   * ของเดิม sheet.clear() ทำงานทุกครั้งไม่ว่าเกิดอะไรขึ้น เครือข่ายที่พังทั้งเชน
+   * ถูก `continue` ข้ามไปเงียบ ๆ แล้วข้อมูลของเชนนั้นก็หายไปจาก Sheet
+   * โดยไม่มีอะไรบอก — ลบของดีทิ้งแล้วใส่ข้อมูลไม่ครบแทน
+   */
+  const {
+    meta: metaCoverage, bal: balCoverage, total: coverage,
+  } = computeEvmCoverage({ metaIntended, metaOk, balIntended, balOk });
 
-  // Step 1: Clear existing content (values only, preserves sheet)
-  try {
-    console.log(`${c.yellow}   Clearing existing sheet content...${c.reset}`);
-    await sheet.clear();
-    await rateLimitDelay();
-    await sheet.setHeaderRow(SHEET_HEADERS);
-    await rateLimitDelay();
-    console.log(`${c.green}   ✓ Sheet cleared and headers set${c.reset}`);
-  } catch (err) {
-    errors.push(`Failed to clear sheet: ${err.message}`);
-    console.log(`${c.red}   ✗ Failed to clear sheet: ${err.message}${c.reset}`);
+  console.log(`\n${c.cyan}${c.bright}>> Coverage: ${(coverage * 100).toFixed(1)}%${c.reset} ` +
+    `${c.gray}(metadata ${(metaCoverage * 100).toFixed(1)}% × balance ${(balCoverage * 100).toFixed(1)}%)${c.reset}`);
+  console.log(`${c.gray}   Collected ${allResults.length} rows from ${networks.length} network(s)${c.reset}`);
+  if (dupSkipped > 0) {
+    console.log(`${c.yellow}   ⏭ ข้ามแถวซ้ำ ${dupSkipped} แถว (ช่องเดิมถูกอ่านมากกว่าหนึ่งครั้ง)${c.reset}`);
   }
 
-  // Step 2: Bulk write in batches with rate limiting
-  if (allResults.length > 0) {
-    const writeChunks = chunkArray(allResults, WRITE_BATCH_SIZE);
-    for (let i = 0; i < writeChunks.length; i++) {
-      const batch = writeChunks[i];
-      try {
-        process.stdout.write(`   ${c.gray}[${String(i + 1).padStart(2, '0')}/${String(writeChunks.length).padStart(2, '0')}]${c.reset} Writing ${String(batch.length).padStart(4, ' ')} rows... `);
-        await sheet.addRows(batch);
-        console.log(`${c.green}✓${c.reset}`);
-        if (i < writeChunks.length - 1) {
-          await rateLimitDelay();
+  let wrote = false;
+  if (coverage < MIN_COVERAGE) {
+    console.log(`${c.red}   ✗ Coverage ต่ำกว่าเกณฑ์ ${(MIN_COVERAGE * 100).toFixed(0)}% — ` +
+      `ยกเลิกการเขียนทับ Sheet เพื่อกันข้อมูลหาย${c.reset}`);
+    console.log(`${c.gray}     ข้อมูลเดิมใน Sheet ยังอยู่ครบ ปรับเกณฑ์ได้ด้วย MIN_COVERAGE${c.reset}`);
+    process.exitCode = 1;
+  } else if (allResults.length === 0) {
+    console.log(`${c.yellow}   ⚠ No data to write — ข้ามการเขียนทับ${c.reset}`);
+  } else {
+    console.log(`\n${c.cyan}${c.bright}>> Writing to Google Sheets...${c.reset}`);
+
+    // Step 1: Clear existing content (values only, preserves sheet)
+    let cleared = false;
+    try {
+      console.log(`${c.yellow}   Clearing existing sheet content...${c.reset}`);
+      await sheet.clear();
+      await rateLimitDelay();
+      await sheet.setHeaderRow(SHEET_HEADERS);
+      await rateLimitDelay();
+      cleared = true;
+      console.log(`${c.green}   ✓ Sheet cleared and headers set${c.reset}`);
+    } catch (err) {
+      errors.push(`Failed to clear sheet: ${err.message}`);
+      console.log(`${c.red}   ✗ Failed to clear sheet: ${err.message}${c.reset}`);
+      process.exitCode = 1;
+    }
+
+    // Step 2: Bulk write in batches with rate limiting
+    if (cleared) {
+      const writeChunks = chunkArray(allResults, WRITE_BATCH_SIZE);
+      let written = 0;
+      for (let i = 0; i < writeChunks.length; i++) {
+        const batch = writeChunks[i];
+        try {
+          process.stdout.write(`   ${c.gray}[${String(i + 1).padStart(2, '0')}/${String(writeChunks.length).padStart(2, '0')}]${c.reset} Writing ${String(batch.length).padStart(4, ' ')} rows... `);
+          await sheet.addRows(batch);
+          written += batch.length;
+          console.log(`${c.green}✓${c.reset}`);
+          if (i < writeChunks.length - 1) {
+            await rateLimitDelay();
+          }
+        } catch (err) {
+          console.log(`${c.red}✗${c.reset}`);
+          errors.push(`Failed to write batch ${i + 1}: ${err.message}`);
+          process.exitCode = 1;
         }
-      } catch (err) {
-        console.log(`${c.red}✗${c.reset}`);
-        errors.push(`Failed to write batch ${i + 1}: ${err.message}`);
+      }
+      wrote = written === allResults.length;
+      if (!wrote) {
+        console.log(`${c.red}   ✗ เขียนได้ ${written}/${allResults.length} แถว — Sheet ไม่ครบ${c.reset}`);
       }
     }
-  } else {
-    console.log(`${c.yellow}   No data to write.${c.reset}`);
   }
 
   const endTime = Date.now();
@@ -425,17 +574,35 @@ async function main() {
   console.log(`${c.cyan}${c.bright}PROCESS SUMMARY: EVM WORKER${c.reset}`);
   console.log(`${c.gray}--------------------------------------------------${c.reset}`);
   console.log(`Execution Time: ${execSecs} seconds`);
+  console.log(`Coverage:       ${(coverage * 100).toFixed(1)}%  |  Wrote sheet: ${wrote ? 'yes' : 'no'}`);
+  console.log(`Networks:       ${networks.length} scanned` +
+    (merged.length ? `, ${merged.length} merged as same chain` : ''));
   console.log(`${c.green}Total Found:    ${totalFound}${c.reset}`);
   console.log(`${c.gray}Total Empty:    ${totalEmpty}${c.reset}`);
-  console.log(`${c.cyan}Total Written:  ${allResults.length}${c.reset}`);
-  
+  if (dupSkipped > 0) console.log(`${c.yellow}Duplicates:     ${dupSkipped} skipped${c.reset}`);
+  console.log(`${c.cyan}Total Written:  ${wrote ? allResults.length : 0}${c.reset}`);
+
   if (errors.length > 0) {
-    console.log(`\n${c.red}Errors encountered:${c.reset}`);
-    errors.forEach(e => console.log(`${c.red}- ${e}${c.reset}`));
+    console.log(`\n${c.red}Errors encountered: ${errors.length}${c.reset}`);
+    errors.slice(0, 15).forEach(e => console.log(`${c.red}- ${e}${c.reset}`));
+    if (errors.length > 15) console.log(`${c.red}- ... and ${errors.length - 15} more${c.reset}`);
+    // มี error = job ต้องไม่ขึ้นเขียว ของเดิม process.exit(0) เสมอ ทำให้ไม่มีใครรู้ว่าพัง
+    process.exitCode = 1;
   }
   console.log(`${c.gray}--------------------------------------------------${c.reset}`);
-  
-  process.exit(0);
+
+  // ไม่เรียก process.exit() เพื่อให้ stdout flush ครบ และคง exit code ที่ตั้งไว้
 }
 
-main();
+// รันเฉพาะตอนถูกเรียกเป็นสคริปต์ — ทำให้ import มาเทสต์ฟังก์ชันย่อยได้โดยไม่สแกนจริง
+const isCli = process.argv[1]
+  && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isCli) {
+  main().catch(err => {
+    console.error(`${c.red}Fatal Error:${c.reset} ${err?.stack || err?.message || err}`);
+    process.exitCode = 1;
+  });
+}
+
+export { dedupeNetworksByChainId, computeEvmCoverage, MIN_COVERAGE };
