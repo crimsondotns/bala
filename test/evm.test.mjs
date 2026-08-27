@@ -5,7 +5,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, MIN_COVERAGE,
+  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc,
+  callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
 } from '../evm.js';
 
 /** probe ปลอม: map ชื่อ -> chainId ถ้าไม่มีในแมพให้ถือว่าถาม chainId ไม่ได้ */
@@ -138,6 +139,33 @@ test('เชนที่สแกนไม่ได้ต้องไม่ถ�
   assert.equal(networks.length, 0);
   assert.equal(merged.length, 0, 'สองตัวที่สแกนไม่ได้ ไม่ใช่ "เชนเดียวกัน"');
   assert.equal(unsupported.length, 2);
+});
+
+// ---- retry ของ multicall ----
+
+test('regression: batch ที่พลาดชั่วคราวต้องถูกลองใหม่จนสำเร็จ', async () => {
+  // run 2026-08-26: Fantom ตอบ 403 แค่ 1 ใน 3 batch อีก 2 ผ่าน = ไม่ถาวร
+  let calls = 0;
+  const res = await callWithRetry(async () => {
+    if (++calls === 1) throw new Error('server response 403 Forbidden');
+    return 'OK';
+  });
+  assert.equal(res, 'OK');
+  assert.equal(calls, 2, 'ครั้งแรกพลาด ครั้งที่สองต้องสำเร็จ');
+});
+
+test('พลาดทุกครั้งต้องโยน error ตัวสุดท้ายออกมา ไม่กลืนเงียบ', async () => {
+  let calls = 0;
+  await assert.rejects(
+    callWithRetry(async () => { calls++; throw new Error('server response 403 Forbidden'); }),
+    /403 Forbidden/);
+  assert.equal(calls, MULTICALL_RETRIES + 1, 'ต้องลองครบตามที่ตั้งไว้');
+});
+
+test('สำเร็จตั้งแต่ครั้งแรกต้องไม่ยิงซ้ำ', async () => {
+  let calls = 0;
+  assert.equal(await callWithRetry(async () => { calls++; return 42; }), 42);
+  assert.equal(calls, 1);
 });
 
 // ---- coverage guard ----
