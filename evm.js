@@ -33,6 +33,8 @@ const MULTICALL_BATCH_SIZE = 500;
 const MIN_COVERAGE = Number(process.env.MIN_COVERAGE || 0.95);
 // timeout ตอนถาม chainId ของแต่ละ RPC
 const CHAIN_ID_TIMEOUT_MS = Number(process.env.CHAIN_ID_TIMEOUT_MS || 10000);
+// ลองยิง multicall ซ้ำกี่ครั้งเมื่อพลาด (0 = ไม่ลองซ้ำ)
+const MULTICALL_RETRIES = Number(process.env.MULTICALL_RETRIES || 2);
 
 // Multicall3 ABI
 const MULTICALL3_ABI = [
@@ -107,6 +109,29 @@ function formatDate(date) {
 function isNotEvmRpc(err) {
   const msg = String(err?.message || err || '');
   return /not implemented|method not found|-32601|-32701|\b501\b|\b405\b|Method Not Allowed/i.test(msg);
+}
+
+/**
+ * ลองยิง multicall ซ้ำเมื่อพลาด พร้อม backoff + jitter
+ *
+ * เดิมยิงครั้งเดียว พลาดคือเสีย batch นั้นทั้งก้อน แต่ความพลาดที่เจอจริงมักไม่ถาวร:
+ * run 2026-08-26 Fantom ตอบ 403 แค่ 1 ใน 3 batch ของ metadata อีก 2 ผ่านปกติ
+ * ซึ่งเป็นลายเซ็นของการถูกจำกัดอัตราชั่วคราว ไม่ใช่การบล็อกถาวร
+ */
+async function callWithRetry(fn) {
+  let lastErr;
+  for (let i = 0; i <= MULTICALL_RETRIES; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < MULTICALL_RETRIES) {
+        const wait = 800 * 2 ** i * (0.7 + Math.random() * 0.6);
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /** ปิด provider แบบไม่โยน error (provider ปลอมในเทสต์ไม่มี destroy) */
@@ -419,7 +444,7 @@ async function main() {
           metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
         }
         try {
-          const results = await multicall.aggregate3.staticCall(metaCalls);
+          const results = await callWithRetry(() => multicall.aggregate3.staticCall(metaCalls));
           // ยิงสำเร็จแล้ว — token ที่ success:false คือ "ไม่มีบนเชนนี้" ไม่ใช่ความล้มเหลว
           metaOk += chunk.length;
           for (let i = 0; i < chunk.length; i++) {
@@ -488,7 +513,7 @@ async function main() {
         balIntended += chunk.length;
 
         try {
-          const results = await multicall.aggregate3.staticCall(chunk);
+          const results = await callWithRetry(() => multicall.aggregate3.staticCall(chunk));
           balOk += chunk.length;
 
           for (let k = 0; k < results.length; k++) {
@@ -656,13 +681,31 @@ async function main() {
   if (dupSkipped > 0) console.log(`${c.yellow}Duplicates:     ${dupSkipped} skipped${c.reset}`);
   console.log(`${c.cyan}Total Written:  ${wrote ? allResults.length : 0}${c.reset}`);
 
+  /**
+   * ผลลัพธ์ของรอบนี้ ไม่ใช่จำนวน error เป็นตัวตัดสินว่า job เขียวหรือแดง
+   *
+   * ของเดิม error แม้แต่ตัวเดียวก็ทำให้ job แดง ทั้งที่ coverage ผ่านเกณฑ์และ
+   * เขียนชีตครบแล้ว ซึ่งขัดกับการตัดสินใจของ guard เอง: ถ้าเรายอมรับว่า 97.2%
+   * ครบพอจะเขียน ก็ไม่ควรประกาศว่ารอบนั้นล้มเหลว
+   *
+   * ข้อมูลที่หายไปจาก error พวกนั้นถูกนับใน coverage อยู่แล้ว จึงไม่มีอะไรตกหล่น
+   * แค่รายงานเป็น Warnings แทน เพื่อให้สีของ job สื่อว่า "ข้อมูลใช้ได้หรือไม่"
+   */
+  const outcomeOk = wrote || (coverage >= MIN_COVERAGE && allResults.length === 0);
+
   if (errors.length > 0) {
-    console.log(`\n${c.red}Errors encountered: ${errors.length}${c.reset}`);
-    errors.slice(0, 15).forEach(e => console.log(`${c.red}- ${e}${c.reset}`));
-    if (errors.length > 15) console.log(`${c.red}- ... and ${errors.length - 15} more${c.reset}`);
-    // มี error = job ต้องไม่ขึ้นเขียว ของเดิม process.exit(0) เสมอ ทำให้ไม่มีใครรู้ว่าพัง
-    process.exitCode = 1;
+    if (outcomeOk) {
+      console.log(`\n${c.yellow}Warnings: ${errors.length} ` +
+        `(ไม่กระทบผลลัพธ์ — ข้อมูลถูกเขียนครบตามเกณฑ์แล้ว)${c.reset}`);
+      errors.slice(0, 15).forEach(e => console.log(`${c.yellow}- ${e}${c.reset}`));
+      if (errors.length > 15) console.log(`${c.yellow}- ... and ${errors.length - 15} more${c.reset}`);
+    } else {
+      console.log(`\n${c.red}Errors encountered: ${errors.length}${c.reset}`);
+      errors.slice(0, 15).forEach(e => console.log(`${c.red}- ${e}${c.reset}`));
+      if (errors.length > 15) console.log(`${c.red}- ... and ${errors.length - 15} more${c.reset}`);
+    }
   }
+  if (!outcomeOk) process.exitCode = 1;
   console.log(`${c.gray}--------------------------------------------------${c.reset}`);
 
   /**
@@ -691,4 +734,7 @@ if (isCli) {
   });
 }
 
-export { dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, MIN_COVERAGE };
+export {
+  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc,
+  callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
+};
