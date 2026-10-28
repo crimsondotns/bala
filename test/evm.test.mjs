@@ -104,6 +104,7 @@ test('isNotEvmRpc แยก "ไม่ใช่ EVM" ออกจาก "ล่�
   assert.equal(isNotEvmRpc(new Error('server response 501 Not Implemented')), true, 'Injective');
   assert.equal(isNotEvmRpc(new Error('405 Method Not Allowed')), true, 'Tron');
   assert.equal(isNotEvmRpc(new Error('error={ "code": -32601, "message": "Method not found" }')), true, 'Sui');
+  assert.equal(isNotEvmRpc(new Error('error={ "code": -32000, "message": "Sui JSON-RPC endpoint has been deprecated. Please use the gRPC endpoint instead" }')), true, 'Sui (deprecated)');
 
   // พวกนี้คือล่มชั่วคราว ต้องไม่ถูกตัดทิ้งถาวร
   assert.equal(isNotEvmRpc(new Error('timeout (chainId)')), false);

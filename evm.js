@@ -28,6 +28,8 @@ const SUBSCRIPTION_ERC20_TAB = 'SUBSCRIPTION ERC20';
 const SHEET_HEADERS = ['Tokens Name', 'Network', 'Tokens Address', 'Amount', 'Wallet Name', 'Wallet Address', 'Timestamp'];
 const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const MULTICALL_BATCH_SIZE = 500;
+// Multicall3.getBlockNumber() — ใช้เช็กว่ามีสัญญาตอบอยู่จริง
+const GET_BLOCK_NUMBER_SELECTOR = '0x42cbb15c';
 
 // สัดส่วนข้อมูลขั้นต่ำที่ต้องอ่านได้ ถึงจะยอมเขียนทับ Sheet
 const MIN_COVERAGE = Number(process.env.MIN_COVERAGE || 0.95);
@@ -104,11 +106,12 @@ function formatDate(date) {
 /**
  * error ที่แปลว่า "ปลายทางนี้ไม่ใช่ EVM JSON-RPC" ไม่ใช่ "ล่มชั่วคราว"
  * เช่น Injective ตอบ 501, Tron ตอบ 405, Sui ตอบ -32601 Method not found
+ * หรือ -32000 "JSON-RPC endpoint has been deprecated ... use the gRPC endpoint"
  * แยกออกจากกันเพราะอันแรกจะไม่มีวันหาย ส่วนอันหลังรอแล้วอาจกลับมา
  */
 function isNotEvmRpc(err) {
   const msg = String(err?.message || err || '');
-  return /not implemented|method not found|-32601|-32701|\b501\b|\b405\b|Method Not Allowed/i.test(msg);
+  return /not implemented|method not found|-32601|-32701|\b501\b|\b405\b|Method Not Allowed|endpoint has been deprecated|gRPC endpoint/i.test(msg);
 }
 
 /**
@@ -141,6 +144,26 @@ function destroyProvider(provider) {
   } catch { /* ปิดไม่ได้ก็ปล่อย */ }
 }
 
+/**
+ * ทำงานแทน aggregate3 บนเชนที่ไม่มี Multicall3 โดยยิง eth_call ทีละตัว
+ * คืนรูปแบบเดียวกัน [{ success, returnData }] โค้ดที่ใช้ผลจึงไม่ต้องแยกกรณี
+ *
+ * ethers รวม call ที่ยิงพร้อมกันเป็น JSON-RPC batch ให้เอง จึงไม่ได้ช้าเท่า 1 call ต่อ 1 request
+ * revert = token ไม่มีบนเชนนี้ (success:false เหมือน allowFailure)
+ * ส่วน error เครือข่ายต้องโยนออกไป ให้ callWithRetry ลองใหม่ และนับเป็นความล้มเหลวจริง
+ */
+async function directAggregate(provider, calls) {
+  return Promise.all(calls.map(async (call) => {
+    try {
+      const returnData = await provider.call({ to: call.target, data: call.callData });
+      return { success: true, returnData };
+    } catch (err) {
+      if (err?.code === 'CALL_EXCEPTION') return { success: false, returnData: '0x' };
+      throw err;
+    }
+  }));
+}
+
 const withTimeout = (p, ms, label) => Promise.race([
   p,
   new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout (${label})`)), ms)),
@@ -168,22 +191,25 @@ async function probeChainId(entry) {
     throw err;
   }
 
-  // มี Multicall3 อยู่จริงไหม — ไม่มี code ที่ที่อยู่นั้น = สแกนด้วย worker ตัวนี้ไม่ได้
+  // มี Multicall3 อยู่จริงไหม — ไม่มีก็ยังอ่านได้ แต่ต้องยิง eth_call ทีละตัวแทน
+  // เช็ก 2 ชั้น: getCode และเรียก getBlockNumber() จริง เพราะบาง RPC ตอบ getCode เพี้ยน
+  // (Merlinchain: ไม่มีสัญญาที่ที่อยู่มาตรฐาน aggregate3 ได้ "0x" กลับมาทุก batch)
+  let multicall = true;
   try {
     const code = await withTimeout(
       provider.getCode(MULTICALL3_ADDRESS), CHAIN_ID_TIMEOUT_MS, 'multicall');
-    if (!code || code === '0x') {
-      provider.destroy();
-      const e = new Error(`ไม่มี Multicall3 บนเชนนี้ (chainId ${net.chainId})`);
-      e.unsupported = true;
-      throw e;
-    }
-  } catch (err) {
-    if (err.unsupported) throw err;
-    // ถาม getCode ไม่ได้ = อาจแค่ล่มชั่วคราว ปล่อยให้ลองสแกนต่อ
+    if (!code || code === '0x') multicall = false;
+  } catch { /* ถาม getCode ไม่ได้ = อาจแค่ล่มชั่วคราว ไปดูชั้นถัดไป */ }
+  if (multicall) {
+    try {
+      const ret = await withTimeout(
+        provider.call({ to: MULTICALL3_ADDRESS, data: GET_BLOCK_NUMBER_SELECTOR }),
+        CHAIN_ID_TIMEOUT_MS, 'multicall');
+      if (ret === '0x') multicall = false;
+    } catch { /* ล่มชั่วคราว ปล่อยให้ลองสแกนแบบ Multicall3 ตามเดิม */ }
   }
 
-  return { chainId: String(net.chainId), provider };
+  return { chainId: String(net.chainId), provider, multicall };
 }
 
 /**
@@ -203,8 +229,8 @@ async function probeChainId(entry) {
 async function dedupeNetworksByChainId(entries, probe = probeChainId) {
   const probes = await Promise.all(entries.map(async (e) => {
     try {
-      const { chainId, provider } = await probe(e);
-      return { ...e, chainId: String(chainId), provider };
+      const { chainId, provider, multicall = true } = await probe(e);
+      return { ...e, chainId: String(chainId), provider, multicall };
     } catch (err) {
       if (err?.unsupported) {
         // worker ตัวนี้อ่านเชนนี้ไม่ได้เลย ไม่ใช่เรื่องชั่วคราว
@@ -428,9 +454,16 @@ async function main() {
     const snapMeta = metaIntended, snapBal = balIntended;
     try {
       console.log(`\n${c.cyan}${c.bright}>> Network: ${network.toUpperCase()}${c.reset}`);
+      // เก็บกลับเข้า netEntry เพื่อให้ถูกปิดตอนจบ ไม่งั้นจะ retry ค้างอยู่เบื้องหลัง
       const provider = netEntry.provider
-        ?? new JsonRpcProvider(netEntry.url, undefined, { staticNetwork: true });
+        ??= new JsonRpcProvider(netEntry.url, undefined, { staticNetwork: true });
       const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
+      const aggregate = netEntry.multicall === false
+        ? (calls) => directAggregate(provider, calls)
+        : (calls) => multicall.aggregate3.staticCall(calls);
+      if (netEntry.multicall === false) {
+        console.log(`${c.yellow}   ไม่มี Multicall3 บนเชนนี้ — อ่านทีละ call แทน (ช้ากว่า แต่ได้ข้อมูลครบ)${c.reset}`);
+      }
 
       // 1. Resolve Metadata via Multicall (No Redis - fetch fresh each run)
       const networkTokens = TOKENS.map(t => ({ address: t.address, sheetSymbol: t.symbol }));
@@ -444,7 +477,7 @@ async function main() {
           metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
         }
         try {
-          const results = await callWithRetry(() => multicall.aggregate3.staticCall(metaCalls));
+          const results = await callWithRetry(() => aggregate(metaCalls));
           // ยิงสำเร็จแล้ว — token ที่ success:false คือ "ไม่มีบนเชนนี้" ไม่ใช่ความล้มเหลว
           metaOk += chunk.length;
           for (let i = 0; i < chunk.length; i++) {
@@ -513,7 +546,7 @@ async function main() {
         balIntended += chunk.length;
 
         try {
-          const results = await callWithRetry(() => multicall.aggregate3.staticCall(chunk));
+          const results = await callWithRetry(() => aggregate(chunk));
           balOk += chunk.length;
 
           for (let k = 0; k < results.length; k++) {
@@ -735,6 +768,6 @@ if (isCli) {
 }
 
 export {
-  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc,
+  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, directAggregate,
   callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
 };
