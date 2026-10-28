@@ -163,6 +163,11 @@ async function aggregateWithSplit(aggregate, calls, depth = 0) {
   }
 }
 
+/** ethers ถอดผล "0x" ไม่ได้ = ที่อยู่นั้นไม่มีสัญญาตอบ (ไม่ใช่ node ล่ม) */
+function isEmptyResult(err) {
+  return err?.code === 'BAD_DATA' && err?.value === '0x';
+}
+
 /** ปิด provider แบบไม่โยน error (provider ปลอมในเทสต์ไม่มี destroy) */
 function destroyProvider(provider) {
   try {
@@ -511,12 +516,23 @@ async function main() {
       const provider = netEntry.provider
         ??= new JsonRpcProvider(netEntry.url, undefined, { staticNetwork: true });
       const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
-      const aggregate = netEntry.multicall === false
-        ? (calls) => directAggregate(provider, calls)
-        : (calls) => multicall.aggregate3.staticCall(calls);
-      if (netEntry.multicall === false) {
-        console.log(`${c.yellow}   ไม่มี Multicall3 บนเชนนี้ — อ่านทีละ call แทน (ช้ากว่า แต่ได้ข้อมูลครบ)${c.reset}`);
-      }
+      const noMulticallNotice = () => console.log(
+        `${c.yellow}   ไม่มี Multicall3 บนเชนนี้ — อ่านทีละ call แทน (ช้ากว่า แต่ได้ข้อมูลครบ)${c.reset}`);
+      let direct = netEntry.multicall === false;
+      if (direct) noMulticallNotice();
+      // ตอน probe node อาจไม่ตอบ จนถูกถือว่ามี Multicall3 ไว้ก่อน (run 2026-10-28 Merlinchain)
+      // จึงตัดสินซ้ำจากผลจริง: aggregate3 ได้ "0x" กลับมา = ไม่มีสัญญาตอบ สลับไปอ่านทีละ call
+      const aggregate = async (calls) => {
+        if (direct) return directAggregate(provider, calls);
+        try {
+          return await multicall.aggregate3.staticCall(calls);
+        } catch (err) {
+          if (!isEmptyResult(err)) throw err;
+          direct = true;
+          noMulticallNotice();
+          return directAggregate(provider, calls);
+        }
+      };
 
       // 1. Resolve Metadata via Multicall (No Redis - fetch fresh each run)
       const networkTokens = TOKENS.map(t => ({ address: t.address, sheetSymbol: t.symbol }));
@@ -821,7 +837,7 @@ if (isCli) {
 }
 
 export {
-  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, directAggregate,
+  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, directAggregate, isEmptyResult,
   aggregateWithSplit,
   callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
 };
