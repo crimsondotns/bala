@@ -178,14 +178,31 @@ function destroyProvider(provider) {
  * revert = token ไม่มีบนเชนนี้ (success:false เหมือน allowFailure)
  * ส่วน error เครือข่ายต้องโยนออกไป ให้ callWithRetry ลองใหม่ และนับเป็นความล้มเหลวจริง
  */
+/** getCode ของแต่ละ token ต่อ provider — ถามครั้งเดียวพอ ทั้ง metadata และ balance ใช้ร่วมกัน */
+const contractCodeCache = new WeakMap();
+
 async function directAggregate(provider, calls, concurrency = DIRECT_CONCURRENCY) {
+  let codeCache = contractCodeCache.get(provider);
+  if (!codeCache) contractCodeCache.set(provider, codeCache = new Map());
+  const hasCode = (addr) => {
+    const key = addr.toLowerCase();
+    if (!codeCache.has(key)) {
+      const p = provider.getCode(addr).then((c) => !!c && c !== '0x');
+      p.catch(() => codeCache.delete(key)); // ถามไม่ได้ ครั้งหน้าถามใหม่
+      codeCache.set(key, p);
+    }
+    return codeCache.get(key);
+  };
   const one = async (call) => {
     try {
+      // ไม่มี contract ที่ที่อยู่นี้ = token ไม่มีบนเชนนี้ ไม่ต้องยิง call
+      // run 2026-10-28: node ของ Merlinchain ตอบ 500 แทน "0x" เมื่อเรียกที่อยู่แบบนี้
+      if (!await hasCode(call.target)) return { success: false, returnData: '0x' };
       const returnData = await provider.call({ to: call.target, data: call.callData });
       return { success: true, returnData };
     } catch (err) {
       if (err?.code === 'CALL_EXCEPTION') return { success: false, returnData: '0x' };
-      throw err;
+      return { error: err };
     }
   };
   // ทยอยยิงเป็นกลุ่มเล็ก ไม่ให้ ethers รวมทั้งหมดเป็น JSON-RPC batch ก้อนเดียว
@@ -193,7 +210,11 @@ async function directAggregate(provider, calls, concurrency = DIRECT_CONCURRENCY
   for (let i = 0; i < calls.length; i += concurrency) {
     out.push(...await Promise.all(calls.slice(i, i + concurrency).map(one)));
   }
-  return out;
+  // พลาดทุกตัว = node ล่มจริง ต้องโยนให้ retry และนับเป็นความล้มเหลว
+  // พลาดบางตัว = token ตัวนั้นทำให้ node error ถือว่าไม่มีบนเชนนี้ ไม่ทิ้งทั้งก้อน
+  const failed = out.filter((r) => r.error);
+  if (failed.length === out.length && out.length > 0) throw failed[0].error;
+  return out.map((r) => (r.error ? { success: false, returnData: '0x' } : r));
 }
 
 const withTimeout = (p, ms, label) => Promise.race([
