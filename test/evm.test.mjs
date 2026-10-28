@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc,
-  callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
+  callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES, aggregateWithSplit, directAggregate,
 } from '../evm.js';
 
 /** probe ปลอม: map ชื่อ -> chainId ถ้าไม่มีในแมพให้ถือว่าถาม chainId ไม่ได้ */
@@ -213,4 +213,36 @@ test('metadata ผ่านแต่ไม่มี token บนเชนไห�
     metaIntended: 400, metaOk: 400, balIntended: 0, balOk: 0,
   });
   assert.equal(cov.total, 1);
+});
+
+test('aggregateWithSplit ผ่าครึ่ง batch ที่ node ไม่รับเพราะใหญ่เกิน และคืนผลตามลำดับเดิม', async () => {
+  const calls = Array.from({ length: 10 }, (_, i) => i);
+  const sizes = [];
+  const res = await aggregateWithSplit(async (cs) => {
+    sizes.push(cs.length);
+    if (cs.length > 4) throw new Error('server response 400 Bad Request');
+    return cs.map((x) => x * 10);
+  }, calls);
+  assert.deepEqual(res, calls.map((x) => x * 10));
+  assert.ok(sizes.every((n) => n % 2 === 0), 'ต้องไม่ผ่าคู่ symbol/decimals');
+});
+
+test('aggregateWithSplit เลิกเมื่อแม้ก้อนเล็กสุดก็ยังพลาด', async () => {
+  let attempts = 0;
+  await assert.rejects(aggregateWithSplit(async () => {
+    attempts++; throw new Error('server response 500 Internal Server Error');
+  }, [1, 2, 3, 4]));
+  // ก้อนซ้ายพลาด ก็ไม่ต้องลองก้อนขวาต่อ — ไม่เสียเวลากับเชนที่ล่มจริง
+  assert.equal(attempts, (MULTICALL_RETRIES + 1) * 3);
+});
+
+test('directAggregate: revert = ไม่มี token, error เครือข่าย = โยนต่อ', async () => {
+  const provider = { call: async ({ to }) => {
+    if (to === 'revert') throw Object.assign(new Error('reverted'), { code: 'CALL_EXCEPTION' });
+    if (to === 'down') throw new Error('server response 500');
+    return '0x01';
+  } };
+  const ok = await directAggregate(provider, [{ target: 'a', callData: '0x' }, { target: 'revert', callData: '0x' }]);
+  assert.deepEqual(ok, [{ success: true, returnData: '0x01' }, { success: false, returnData: '0x' }]);
+  await assert.rejects(directAggregate(provider, [{ target: 'down', callData: '0x' }]));
 });

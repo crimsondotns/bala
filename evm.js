@@ -37,6 +37,10 @@ const MIN_COVERAGE = Number(process.env.MIN_COVERAGE || 0.95);
 const CHAIN_ID_TIMEOUT_MS = Number(process.env.CHAIN_ID_TIMEOUT_MS || 10000);
 // ลองยิง multicall ซ้ำกี่ครั้งเมื่อพลาด (0 = ไม่ลองซ้ำ)
 const MULTICALL_RETRIES = Number(process.env.MULTICALL_RETRIES || 2);
+// batch ที่พลาดหลัง retry จะถูกผ่าครึ่งได้กี่ชั้น (500 → 250 → 125 → 63 → 32)
+const SPLIT_DEPTH = Number(process.env.SPLIT_DEPTH || 4);
+// เชนที่ไม่มี Multicall3: ยิง eth_call พร้อมกันทีละกี่ตัว (node บางตัวไม่รับ JSON-RPC batch ใหญ่)
+const DIRECT_CONCURRENCY = Number(process.env.DIRECT_CONCURRENCY || 25);
 
 // Multicall3 ABI
 const MULTICALL3_ABI = [
@@ -137,6 +141,28 @@ async function callWithRetry(fn) {
   throw lastErr;
 }
 
+/**
+ * ยิง batch แล้วถ้ายังพลาดหลัง retry ให้ผ่าครึ่งแล้วลองใหม่ (สูงสุด SPLIT_DEPTH ชั้น)
+ *
+ * run 2026-10-27: BSC ตอบ 400 กับ 3 ใน 14 batch และ node ของ Merlinchain ตอบ 500
+ * กับทุก batch ขนาด 250 — ทั้งคู่คือ node ไม่รับ request ก้อนใหญ่ ไม่ใช่เชนล่ม
+ * เดิม batch ที่พลาดจะถูกนับว่าอ่านไม่ได้ทั้งก้อน จน coverage ตกต่ำกว่าเกณฑ์
+ * ผลถูกต่อกลับตามลำดับเดิม โค้ดที่ใช้ผลจึงไม่ต้องรู้ว่ามีการผ่า
+ */
+async function aggregateWithSplit(aggregate, calls, depth = 0) {
+  try {
+    return await callWithRetry(() => aggregate(calls));
+  } catch (err) {
+    if (depth >= SPLIT_DEPTH || calls.length < 2) throw err;
+    // จำนวนคู่ไว้ เพราะ metadata ส่ง symbol/decimals เป็นคู่ติดกัน
+    let mid = Math.ceil(calls.length / 4) * 2;
+    if (mid >= calls.length) mid = Math.ceil(calls.length / 2); // ก้อน 2 ตัวสุดท้ายต้องผ่าได้จริง
+    const left = await aggregateWithSplit(aggregate, calls.slice(0, mid), depth + 1);
+    const right = await aggregateWithSplit(aggregate, calls.slice(mid), depth + 1);
+    return [...left, ...right];
+  }
+}
+
 /** ปิด provider แบบไม่โยน error (provider ปลอมในเทสต์ไม่มี destroy) */
 function destroyProvider(provider) {
   try {
@@ -152,8 +178,8 @@ function destroyProvider(provider) {
  * revert = token ไม่มีบนเชนนี้ (success:false เหมือน allowFailure)
  * ส่วน error เครือข่ายต้องโยนออกไป ให้ callWithRetry ลองใหม่ และนับเป็นความล้มเหลวจริง
  */
-async function directAggregate(provider, calls) {
-  return Promise.all(calls.map(async (call) => {
+async function directAggregate(provider, calls, concurrency = DIRECT_CONCURRENCY) {
+  const one = async (call) => {
     try {
       const returnData = await provider.call({ to: call.target, data: call.callData });
       return { success: true, returnData };
@@ -161,7 +187,13 @@ async function directAggregate(provider, calls) {
       if (err?.code === 'CALL_EXCEPTION') return { success: false, returnData: '0x' };
       throw err;
     }
-  }));
+  };
+  // ทยอยยิงเป็นกลุ่มเล็ก ไม่ให้ ethers รวมทั้งหมดเป็น JSON-RPC batch ก้อนเดียว
+  const out = [];
+  for (let i = 0; i < calls.length; i += concurrency) {
+    out.push(...await Promise.all(calls.slice(i, i + concurrency).map(one)));
+  }
+  return out;
 }
 
 const withTimeout = (p, ms, label) => Promise.race([
@@ -477,7 +509,7 @@ async function main() {
           metaCalls.push({ target: pt.address, allowFailure: true, callData: ERC20_INTERFACE.encodeFunctionData("decimals") });
         }
         try {
-          const results = await callWithRetry(() => aggregate(metaCalls));
+          const results = await aggregateWithSplit(aggregate, metaCalls);
           // ยิงสำเร็จแล้ว — token ที่ success:false คือ "ไม่มีบนเชนนี้" ไม่ใช่ความล้มเหลว
           metaOk += chunk.length;
           for (let i = 0; i < chunk.length; i++) {
@@ -546,7 +578,7 @@ async function main() {
         balIntended += chunk.length;
 
         try {
-          const results = await callWithRetry(() => aggregate(chunk));
+          const results = await aggregateWithSplit(aggregate, chunk);
           balOk += chunk.length;
 
           for (let k = 0; k < results.length; k++) {
@@ -769,5 +801,6 @@ if (isCli) {
 
 export {
   dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, directAggregate,
+  aggregateWithSplit,
   callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
 };
