@@ -237,7 +237,7 @@ test('aggregateWithSplit เลิกเมื่อแม้ก้อนเล�
 });
 
 test('directAggregate: revert = ไม่มี token, error เครือข่าย = โยนต่อ', async () => {
-  const provider = { call: async ({ to }) => {
+  const provider = { getCode: async () => '0x60', call: async ({ to }) => {
     if (to === 'revert') throw Object.assign(new Error('reverted'), { code: 'CALL_EXCEPTION' });
     if (to === 'down') throw new Error('server response 500');
     return '0x01';
@@ -245,4 +245,15 @@ test('directAggregate: revert = ไม่มี token, error เครือข�
   const ok = await directAggregate(provider, [{ target: 'a', callData: '0x' }, { target: 'revert', callData: '0x' }]);
   assert.deepEqual(ok, [{ success: true, returnData: '0x01' }, { success: false, returnData: '0x' }]);
   await assert.rejects(directAggregate(provider, [{ target: 'down', callData: '0x' }]));
+});
+
+test('directAggregate: ที่อยู่ไม่มี contract ไม่ถูกยิง call และ error เฉพาะตัวไม่ทำให้ทั้งก้อนพัง', async () => {
+  const called = [];
+  const provider = {
+    getCode: async (a) => (a === 'eoa' ? '0x' : '0x60'),
+    call: async ({ to }) => { called.push(to); if (to === 'bad') throw new Error('server response 500'); return '0x01'; },
+  };
+  const res = await directAggregate(provider, ['a', 'eoa', 'bad'].map((target) => ({ target, callData: '0x' })));
+  assert.deepEqual(res.map((r) => r.success), [true, false, false]);
+  assert.deepEqual(called, ['a', 'bad']);
 });

@@ -163,6 +163,11 @@ async function aggregateWithSplit(aggregate, calls, depth = 0) {
   }
 }
 
+/** ethers ถอดผล "0x" ไม่ได้ = ที่อยู่นั้นไม่มีสัญญาตอบ (ไม่ใช่ node ล่ม) */
+function isEmptyResult(err) {
+  return err?.code === 'BAD_DATA' && err?.value === '0x';
+}
+
 /** ปิด provider แบบไม่โยน error (provider ปลอมในเทสต์ไม่มี destroy) */
 function destroyProvider(provider) {
   try {
@@ -178,14 +183,31 @@ function destroyProvider(provider) {
  * revert = token ไม่มีบนเชนนี้ (success:false เหมือน allowFailure)
  * ส่วน error เครือข่ายต้องโยนออกไป ให้ callWithRetry ลองใหม่ และนับเป็นความล้มเหลวจริง
  */
+/** getCode ของแต่ละ token ต่อ provider — ถามครั้งเดียวพอ ทั้ง metadata และ balance ใช้ร่วมกัน */
+const contractCodeCache = new WeakMap();
+
 async function directAggregate(provider, calls, concurrency = DIRECT_CONCURRENCY) {
+  let codeCache = contractCodeCache.get(provider);
+  if (!codeCache) contractCodeCache.set(provider, codeCache = new Map());
+  const hasCode = (addr) => {
+    const key = addr.toLowerCase();
+    if (!codeCache.has(key)) {
+      const p = provider.getCode(addr).then((c) => !!c && c !== '0x');
+      p.catch(() => codeCache.delete(key)); // ถามไม่ได้ ครั้งหน้าถามใหม่
+      codeCache.set(key, p);
+    }
+    return codeCache.get(key);
+  };
   const one = async (call) => {
     try {
+      // ไม่มี contract ที่ที่อยู่นี้ = token ไม่มีบนเชนนี้ ไม่ต้องยิง call
+      // run 2026-10-28: node ของ Merlinchain ตอบ 500 แทน "0x" เมื่อเรียกที่อยู่แบบนี้
+      if (!await hasCode(call.target)) return { success: false, returnData: '0x' };
       const returnData = await provider.call({ to: call.target, data: call.callData });
       return { success: true, returnData };
     } catch (err) {
       if (err?.code === 'CALL_EXCEPTION') return { success: false, returnData: '0x' };
-      throw err;
+      return { error: err };
     }
   };
   // ทยอยยิงเป็นกลุ่มเล็ก ไม่ให้ ethers รวมทั้งหมดเป็น JSON-RPC batch ก้อนเดียว
@@ -193,7 +215,11 @@ async function directAggregate(provider, calls, concurrency = DIRECT_CONCURRENCY
   for (let i = 0; i < calls.length; i += concurrency) {
     out.push(...await Promise.all(calls.slice(i, i + concurrency).map(one)));
   }
-  return out;
+  // พลาดทุกตัว = node ล่มจริง ต้องโยนให้ retry และนับเป็นความล้มเหลว
+  // พลาดบางตัว = token ตัวนั้นทำให้ node error ถือว่าไม่มีบนเชนนี้ ไม่ทิ้งทั้งก้อน
+  const failed = out.filter((r) => r.error);
+  if (failed.length === out.length && out.length > 0) throw failed[0].error;
+  return out.map((r) => (r.error ? { success: false, returnData: '0x' } : r));
 }
 
 const withTimeout = (p, ms, label) => Promise.race([
@@ -490,12 +516,23 @@ async function main() {
       const provider = netEntry.provider
         ??= new JsonRpcProvider(netEntry.url, undefined, { staticNetwork: true });
       const multicall = new Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
-      const aggregate = netEntry.multicall === false
-        ? (calls) => directAggregate(provider, calls)
-        : (calls) => multicall.aggregate3.staticCall(calls);
-      if (netEntry.multicall === false) {
-        console.log(`${c.yellow}   ไม่มี Multicall3 บนเชนนี้ — อ่านทีละ call แทน (ช้ากว่า แต่ได้ข้อมูลครบ)${c.reset}`);
-      }
+      const noMulticallNotice = () => console.log(
+        `${c.yellow}   ไม่มี Multicall3 บนเชนนี้ — อ่านทีละ call แทน (ช้ากว่า แต่ได้ข้อมูลครบ)${c.reset}`);
+      let direct = netEntry.multicall === false;
+      if (direct) noMulticallNotice();
+      // ตอน probe node อาจไม่ตอบ จนถูกถือว่ามี Multicall3 ไว้ก่อน (run 2026-10-28 Merlinchain)
+      // จึงตัดสินซ้ำจากผลจริง: aggregate3 ได้ "0x" กลับมา = ไม่มีสัญญาตอบ สลับไปอ่านทีละ call
+      const aggregate = async (calls) => {
+        if (direct) return directAggregate(provider, calls);
+        try {
+          return await multicall.aggregate3.staticCall(calls);
+        } catch (err) {
+          if (!isEmptyResult(err)) throw err;
+          direct = true;
+          noMulticallNotice();
+          return directAggregate(provider, calls);
+        }
+      };
 
       // 1. Resolve Metadata via Multicall (No Redis - fetch fresh each run)
       const networkTokens = TOKENS.map(t => ({ address: t.address, sheetSymbol: t.symbol }));
@@ -800,7 +837,7 @@ if (isCli) {
 }
 
 export {
-  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, directAggregate,
+  dedupeNetworksByChainId, computeEvmCoverage, isNotEvmRpc, directAggregate, isEmptyResult,
   aggregateWithSplit,
   callWithRetry, MIN_COVERAGE, MULTICALL_RETRIES,
 };
